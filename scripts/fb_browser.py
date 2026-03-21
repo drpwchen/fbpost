@@ -81,10 +81,31 @@ def convert_cookies(profile: str) -> list[dict]:
     return pw_cookies
 
 
-async def create_browser_context(profile: str, headless: bool = True):
+def _user_data_dir(profile: str) -> str:
+    return os.path.join(_profile_dir(profile), "chromium_data")
+
+
+async def connect_to_running_chrome(p):
+    """Try to connect to a running Chrome with remote debugging on port 9222.
+
+    Start Chrome with: /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222
+    Returns browser or None.
+    """
+    try:
+        browser = await p.chromium.connect_over_cdp("http://127.0.0.1:9222", timeout=2000)
+        return browser
+    except Exception:
+        return None
+
+
+async def create_browser_context(profile: str, headless: bool = True, persistent: bool = False):
     """Create Playwright browser context with cookies or storage state.
 
+    If persistent=True, uses a persistent browser context (reuses Chromium
+    profile data across runs — much faster startup, no cookie re-injection).
+
     Returns (playwright, browser, context) tuple. Caller must close.
+    For persistent contexts, browser is None (context IS the browser).
     """
     p = await async_playwright().start()
 
@@ -92,6 +113,57 @@ async def create_browser_context(profile: str, headless: bool = True):
         "--disable-blink-features=AutomationControlled",
     ]
 
+    ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+
+    # Try to connect to running Chrome first (fastest path)
+    if not headless:
+        browser = await connect_to_running_chrome(p)
+        if browser:
+            context = browser.contexts[0] if browser.contexts else await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent=ua,
+            )
+            print("Connected to running Chrome (CDP).")
+            return p, browser, context
+
+    if persistent:
+        user_data = _user_data_dir(profile)
+        os.makedirs(user_data, exist_ok=True)
+
+        context = await p.chromium.launch_persistent_context(
+            user_data,
+            headless=headless,
+            args=launch_args,
+            viewport={"width": 1920, "height": 1080},
+            user_agent=ua,
+        )
+
+        # Always ensure cookies are present — persistent context may
+        # lose them on first run or after cleanup
+        try:
+            existing = await context.cookies("https://www.facebook.com")
+            has_auth = any(c["name"] == "c_user" for c in existing)
+        except Exception:
+            has_auth = False
+
+        if not has_auth:
+            # Try storage_state cookies first, then raw cookies
+            storage_path = _storage_state_path(profile)
+            if os.path.exists(storage_path):
+                with open(storage_path) as f:
+                    state = json.load(f)
+                if state.get("cookies"):
+                    await context.add_cookies(state["cookies"])
+                    has_auth = True
+
+            if not has_auth:
+                pw_cookies = convert_cookies(profile)
+                await context.add_cookies(pw_cookies)
+
+        await stealth.apply_stealth_async(context)
+        return p, None, context
+
+    # Non-persistent (original behavior)
     browser = await p.chromium.launch(
         headless=headless,
         args=launch_args,
@@ -104,12 +176,12 @@ async def create_browser_context(profile: str, headless: bool = True):
         context = await browser.new_context(
             storage_state=storage_path,
             viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+            user_agent=ua,
         )
     else:
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+            user_agent=ua,
         )
         # Inject cookies from cookies.json
         pw_cookies = convert_cookies(profile)

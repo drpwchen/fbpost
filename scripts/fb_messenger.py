@@ -106,10 +106,12 @@ def list_contacts(profile: str):
 
 async def send_message(profile: str, thread_id: str, text: str, headless: bool = True):
     """Send a message to a Messenger thread."""
-    p, browser, context = await create_browser_context(profile, headless)
+    p, browser, context = await create_browser_context(profile, headless, persistent=True)
 
     try:
-        page = await context.new_page()
+        # Reuse existing page or create new one
+        pages = context.pages
+        page = pages[0] if pages else await context.new_page()
 
         if thread_id.isdigit() and len(thread_id) > 15:
             url = f"https://www.facebook.com/messages/e2ee/t/{thread_id}/"
@@ -117,45 +119,46 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
             url = f"https://www.facebook.com/messages/t/{thread_id}/"
         print(f"Navigating to {url}...")
         await page.goto(url, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
 
         if not await verify_login(page):
             print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
             sys.exit(1)
 
-        # Handle PIN dialog for E2E threads
-        await _dismiss_dialogs(page, profile)
-        await page.wait_for_timeout(1000)
-
-        # Wait for the message input to appear
+        # Wait for the message input OR PIN dialog (race condition)
         print("Waiting for message input...")
         input_box = page.get_by_role("textbox", name="Message")
+        pin_input = page.locator('input[aria-label*="PIN"], input[aria-label*="pin"]').first
 
-        try:
-            await input_box.wait_for(state="visible", timeout=15000)
-        except Exception:
-            # Fallback: try contenteditable
-            input_box = page.locator('[contenteditable="true"][role="textbox"]').first
-            await input_box.wait_for(state="visible", timeout=10000)
+        # Race: wait for either input box or PIN dialog
+        for attempt in range(3):
+            try:
+                await input_box.wait_for(state="visible", timeout=5000)
+                break  # input ready
+            except Exception:
+                # Check if PIN dialog appeared
+                if await _dismiss_dialogs(page, profile):
+                    # PIN was entered, wait for input again
+                    continue
+                if attempt == 2:
+                    # Last resort: try contenteditable
+                    input_box = page.locator('[contenteditable="true"][role="textbox"]').first
+                    await input_box.wait_for(state="visible", timeout=5000)
 
-        # Type the message with human-like delay
+        # Fill and send — minimal delays
         await input_box.click()
-        await page.wait_for_timeout(500)
         await input_box.fill(text)
-        await page.wait_for_timeout(1000)
-
-        # Send with Enter
+        await page.wait_for_timeout(200)
         await input_box.press("Enter")
         print(f"Message sent: \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
 
-        # Wait for message to be sent
-        await page.wait_for_timeout(2000)
-
-        # Save state for next time
-        await save_storage_state(context, profile)
+        # Brief wait for send confirmation
+        await page.wait_for_timeout(500)
 
     finally:
-        await browser.close()
+        if browser:
+            await browser.close()
+        else:
+            await context.close()
         await p.stop()
 
 
