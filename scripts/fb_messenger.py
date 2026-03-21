@@ -144,15 +144,23 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
                     input_box = page.locator('[contenteditable="true"][role="textbox"]').first
                     await input_box.wait_for(state="visible", timeout=5000)
 
-        # Fill and send — minimal delays
+        # Fill and send
         await input_box.click()
         await input_box.fill(text)
-        await page.wait_for_timeout(200)
+        await page.wait_for_timeout(300)
         await input_box.press("Enter")
+
+        # Wait for message to actually appear in the thread before closing
+        # Look for our text in a sent message row
+        try:
+            sent_indicator = page.locator(f'[role="main"] [role="row"]:has-text("{text[:30]}")')
+            await sent_indicator.wait_for(state="attached", timeout=8000)
+        except Exception:
+            # Fallback: fixed wait if we can't detect the sent message
+            await page.wait_for_timeout(3000)
+
         print(f"Message sent: \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
 
-        # Brief wait for send confirmation
-        await page.wait_for_timeout(500)
 
     finally:
         if browser:
