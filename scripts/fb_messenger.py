@@ -130,15 +130,20 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
         if not page:
             page = await context.new_page()
 
-        # Navigate (skip if already on the right thread)
-        if thread_id not in page.url:
+        # Navigate — always go to URL (even for daemon, thread may differ)
+        current_thread = ""
+        for part in ["/messages/e2ee/t/", "/messages/t/"]:
+            if part in page.url:
+                current_thread = page.url.split(part)[-1].rstrip("/").split("?")[0]
+
+        if current_thread == thread_id:
+            print(f"Reusing existing page for {thread_id}.")
+            await page.bring_to_front()
+        else:
             print(f"Navigating to {url}...")
             await page.goto(url, wait_until="domcontentloaded")
-        else:
-            print(f"Reusing existing page for {thread_id}.")
-            # Re-focus the page to ensure input is interactive
-            await page.bring_to_front()
-            await page.wait_for_timeout(300)
+            # New thread may need PIN
+            await _dismiss_dialogs(page, profile)
 
         if not await verify_login(page):
             print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
