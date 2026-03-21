@@ -22,7 +22,10 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
     try:
         page = await context.new_page()
 
-        url = f"https://www.facebook.com/messages/t/{thread_id}/"
+        if thread_id.isdigit() and len(thread_id) > 15:
+            url = f"https://www.facebook.com/messages/e2ee/t/{thread_id}/"
+        else:
+            url = f"https://www.facebook.com/messages/t/{thread_id}/"
         print(f"Navigating to {url}...")
         await page.goto(url, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
@@ -30,6 +33,10 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
         if not await verify_login(page):
             print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
             sys.exit(1)
+
+        # Handle PIN dialog for E2E threads
+        await _dismiss_dialogs(page, profile)
+        await page.wait_for_timeout(1000)
 
         # Wait for the message input to appear
         print("Waiting for message input...")
@@ -342,7 +349,11 @@ async def read_thread(
     try:
         page = await context.new_page()
 
-        url = f"https://www.facebook.com/messages/t/{thread_id}/"
+        # Use E2E URL path for numeric thread IDs (encrypted threads)
+        if thread_id.isdigit() and len(thread_id) > 15:
+            url = f"https://www.facebook.com/messages/e2ee/t/{thread_id}/"
+        else:
+            url = f"https://www.facebook.com/messages/t/{thread_id}/"
         print(f"Navigating to {url}...")
         await page.goto(url, wait_until="domcontentloaded")
         await page.wait_for_timeout(3000)
@@ -350,6 +361,10 @@ async def read_thread(
         if not await verify_login(page):
             print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
             sys.exit(1)
+
+        # Handle PIN dialog for E2E threads
+        await _dismiss_dialogs(page, profile)
+        await page.wait_for_timeout(1000)
 
         print("Loading messages...")
         await page.wait_for_timeout(2000)
