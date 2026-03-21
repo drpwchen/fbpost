@@ -4,12 +4,24 @@ __pycache__/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
 # Virtual environments
-.venv
+.venv/
 
 # Secrets and captures
 .env
 cookies.json
 *.har
+
+# Runtime state
+.last_comments.json
+
+# OS files
+.DS_Store
+
+# Claude Code (personal skills/config)
+.claude/
+
+# Profile cookies and state (keep .gitkeep)
+profiles/*/

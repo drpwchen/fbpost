@@ -1,0 +1,745 @@
+"""Messenger operations via Playwright browser automation."""
+
+import asyncio
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+
+from scripts.fb_browser import (
+    create_browser_context,
+    handle_pin_dialog,
+    save_storage_state,
+    verify_login,
+)
+
+
+async def send_message(profile: str, thread_id: str, text: str, headless: bool = True):
+    """Send a message to a Messenger thread."""
+    p, browser, context = await create_browser_context(profile, headless)
+
+    try:
+        page = await context.new_page()
+
+        url = f"https://www.facebook.com/messages/t/{thread_id}/"
+        print(f"Navigating to {url}...")
+        await page.goto(url, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+
+        if not await verify_login(page):
+            print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
+            sys.exit(1)
+
+        # Wait for the message input to appear
+        print("Waiting for message input...")
+        input_box = page.get_by_role("textbox", name="Message")
+
+        try:
+            await input_box.wait_for(state="visible", timeout=15000)
+        except Exception:
+            # Fallback: try contenteditable
+            input_box = page.locator('[contenteditable="true"][role="textbox"]').first
+            await input_box.wait_for(state="visible", timeout=10000)
+
+        # Type the message with human-like delay
+        await input_box.click()
+        await page.wait_for_timeout(500)
+        await input_box.fill(text)
+        await page.wait_for_timeout(1000)
+
+        # Send with Enter
+        await input_box.press("Enter")
+        print(f"Message sent: \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
+
+        # Wait for message to be sent
+        await page.wait_for_timeout(2000)
+
+        # Save state for next time
+        await save_storage_state(context, profile)
+
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+async def _extract_conversations(page, count: int) -> list[dict]:
+    """Extract conversation list from Messenger sidebar."""
+    # Use role="row" inside the navigation area — catches both regular and E2E chats
+    rows = page.locator('div[role="navigation"] div[role="row"]')
+    row_count = await rows.count()
+
+    conversations = []
+
+    for i in range(row_count):
+        if len(conversations) >= count:
+            break
+        try:
+            row = rows.nth(i)
+            box = await row.bounding_box()
+            # Only sidebar items (x < 400, reasonable y)
+            if not box or box["x"] > 400:
+                continue
+
+            text_content = await row.inner_text()
+            lines = [l.strip() for l in text_content.split("\n") if l.strip()]
+            if not lines:
+                continue
+
+            # Try to get thread ID from an <a> link inside this row
+            thread_id = ""
+            link = row.locator('a[href*="/messages/t/"]').first
+            try:
+                href = await link.get_attribute("href", timeout=1000) or ""
+                if "/messages/t/" in href:
+                    thread_id = href.split("/messages/t/")[-1].rstrip("/").split("?")[0]
+            except Exception:
+                pass
+
+            name = lines[0]
+            preview = lines[1] if len(lines) > 1 else ""
+            time_str = lines[-1] if len(lines) > 2 else ""
+
+            conversations.append({
+                "name": name,
+                "preview": preview,
+                "time": time_str,
+                "thread_id": thread_id,
+            })
+        except Exception:
+            continue
+
+    return conversations
+
+
+async def list_inbox(profile: str, count: int = 20, headless: bool = True):
+    """List Messenger inbox conversations."""
+    p, browser, context = await create_browser_context(profile, headless)
+
+    try:
+        page = await context.new_page()
+
+        print("Navigating to Messenger...")
+        await page.goto(
+            "https://www.facebook.com/messages/",
+            wait_until="domcontentloaded",
+        )
+        await page.wait_for_timeout(3000)
+
+        if not await verify_login(page):
+            print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
+            sys.exit(1)
+
+        print("Loading conversations...")
+        await page.wait_for_timeout(2000)
+
+        conversations = await _extract_conversations(page, count)
+
+        # Print results
+        print()
+        print(f"  {'#':<4} {'Name':<25} {'Thread ID':<20} {'Preview'}")
+        print(f"  {'─' * 80}")
+        for i, c in enumerate(conversations):
+            preview = c["preview"][:40] + ("..." if len(c["preview"]) > 40 else "")
+            tid = c["thread_id"][:18] if c["thread_id"] else "?"
+            print(f"  {i:<4} {c['name']:<25} {tid:<20} {preview}")
+
+        print(f"\n  {len(conversations)} conversations shown.")
+
+        await save_storage_state(context, profile)
+
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+async def _dismiss_dialogs(page, profile: str = "default"):
+    """Dismiss any blocking dialogs (e.g. E2E encryption PIN prompt)."""
+    # First try entering PIN if the dialog is for E2E encryption
+    if await handle_pin_dialog(page, profile):
+        return True
+
+    # Then try common dismiss/close buttons
+    for selector in [
+        '[aria-label="Close"], [aria-label="關閉"]',
+        'div[role="dialog"] [aria-label="Close"], div[role="dialog"] [aria-label="關閉"]',
+        'a:has-text("稍後再說")',
+        'a:has-text("Not now")',
+        '[role="dialog"] a[role="button"]',
+    ]:
+        try:
+            btn = page.locator(selector).first
+            if await btn.is_visible():
+                await btn.click()
+                await page.wait_for_timeout(1000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def search_and_read(
+    profile: str, query: str, count: int = 20, headless: bool = True
+):
+    """Search for a user in Messenger, open their thread, and read messages."""
+    p, browser, context = await create_browser_context(profile, headless)
+
+    try:
+        page = await context.new_page()
+
+        print("Navigating to Messenger...")
+        await page.goto(
+            "https://www.facebook.com/messages/",
+            wait_until="domcontentloaded",
+        )
+        await page.wait_for_timeout(4000)
+
+        if not await verify_login(page):
+            print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
+            sys.exit(1)
+
+        # Dismiss any blocking dialogs
+        await _dismiss_dialogs(page, profile)
+        await page.wait_for_timeout(1000)
+
+        # Find the Messenger search box (supports both EN and zh-TW labels)
+        print(f"Searching for \"{query}\"...")
+        search_box = page.locator(
+            'input[aria-label*="Messenger"], input[aria-label*="messenger"]'
+        ).first
+
+        try:
+            await search_box.wait_for(state="visible", timeout=5000)
+        except Exception:
+            # Maybe still behind a dialog — try again
+            await _dismiss_dialogs(page, profile)
+            await page.wait_for_timeout(1000)
+            await search_box.wait_for(state="visible", timeout=5000)
+
+        await search_box.click()
+        await page.wait_for_timeout(500)
+        await search_box.fill(query)
+        await page.wait_for_timeout(3000)
+
+        # Click the matching search result
+        # Search results appear as listbox options or links
+        result_links = page.locator('a[href*="/messages/t/"]')
+        result_count = await result_links.count()
+
+        # Count only the new results (not the existing sidebar chats)
+        # The search dropdown results are typically in a listbox
+        listbox_items = page.get_by_role("option")
+        listbox_count = await listbox_items.count()
+
+        clicked = False
+        if listbox_count > 0:
+            # Find the result matching our query
+            for i in range(min(listbox_count, 10)):
+                item = listbox_items.nth(i)
+                try:
+                    text = await item.inner_text()
+                    if query in text:
+                        await item.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                await listbox_items.first.click()
+                clicked = True
+        elif result_count > 0:
+            for i in range(min(result_count, 10)):
+                link = result_links.nth(i)
+                try:
+                    text = await link.inner_text()
+                    if query in text:
+                        await link.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                await result_links.first.click()
+                clicked = True
+
+        if not clicked:
+            print(f"No results found for \"{query}\".")
+            await save_storage_state(context, profile)
+            return
+
+        await page.wait_for_timeout(4000)
+
+        # Dismiss any post-navigation dialogs (e.g. PIN prompt)
+        await _dismiss_dialogs(page, profile)
+        await page.wait_for_timeout(1000)
+
+        # Get thread ID from URL
+        current_url = page.url
+        thread_id = ""
+        if "/messages/t/" in current_url:
+            thread_id = current_url.split("/messages/t/")[-1].rstrip("/").split("?")[0]
+
+        print(f"Opened thread: {thread_id or '(unknown)'}")
+        print("Reading messages...")
+        await page.wait_for_timeout(2000)
+
+        messages = await _extract_messages(page, count)
+
+        # Print messages
+        print()
+        if thread_id:
+            print(f"  Thread: {thread_id}")
+        print(f"  {'─' * 60}")
+        for msg in messages:
+            for line in msg.split("\n"):
+                line = line.strip()
+                if line:
+                    print(f"  {line}")
+            print()
+
+        print(f"  {len(messages)} messages shown.")
+
+        await save_storage_state(context, profile)
+
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+async def _extract_messages(page, count: int) -> list[str]:
+    """Extract messages from the current Messenger thread view."""
+    # Messages are in role="row" elements within the message list
+    message_rows = page.get_by_role("row")
+    msg_count = await message_rows.count()
+
+    if msg_count == 0:
+        # Fallback: look for message group containers
+        message_rows = page.locator('[data-scope="messages_table"] div[role="row"]')
+        msg_count = await message_rows.count()
+
+    messages = []
+    start = max(0, msg_count - count)
+
+    for i in range(start, msg_count):
+        try:
+            row = message_rows.nth(i)
+            text_content = await row.inner_text()
+            text_content = text_content.strip()
+            if text_content:
+                messages.append(text_content)
+        except Exception:
+            continue
+
+    return messages
+
+
+async def read_thread(
+    profile: str, thread_id: str, count: int = 20, headless: bool = True
+):
+    """Read messages from a specific Messenger thread."""
+    p, browser, context = await create_browser_context(profile, headless)
+
+    try:
+        page = await context.new_page()
+
+        url = f"https://www.facebook.com/messages/t/{thread_id}/"
+        print(f"Navigating to {url}...")
+        await page.goto(url, wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000)
+
+        if not await verify_login(page):
+            print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
+            sys.exit(1)
+
+        print("Loading messages...")
+        await page.wait_for_timeout(2000)
+
+        messages = await _extract_messages(page, count)
+
+        # Print messages
+        print()
+        print(f"  Thread: {thread_id}")
+        print(f"  {'─' * 60}")
+        for msg in messages:
+            for line in msg.split("\n"):
+                line = line.strip()
+                if line:
+                    print(f"  {line}")
+            print()
+
+        print(f"  {len(messages)} messages shown.")
+
+        await save_storage_state(context, profile)
+
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+def _parse_timestamp(text: str, reference_date: datetime | None = None) -> str | None:
+    """Try to parse a Chinese/English timestamp string into ISO format.
+
+    Handles patterns like:
+    - 今天上午3:06 / 今天下午11:55
+    - 昨天上午10:30
+    - 週一 ~ 週日 (weekday names)
+    - 3月5日 上午9:00
+    - 2026年3月5日
+    - Mar 5, 2026
+    - 上午/下午 HH:MM (standalone)
+    """
+    if not reference_date:
+        reference_date = datetime.now()
+
+    text = text.strip()
+
+    # Skip non-timestamp strings
+    if not text or len(text) > 40:
+        return None
+
+    # "今天" (today)
+    m = re.match(r'今天\s*(上午|下午)(\d{1,2}):(\d{2})', text)
+    if m:
+        period, h, mi = m.group(1), int(m.group(2)), int(m.group(3))
+        if period == '下午' and h != 12:
+            h += 12
+        elif period == '上午' and h == 12:
+            h = 0
+        return reference_date.replace(hour=h, minute=mi, second=0).isoformat(timespec='minutes')
+
+    # "昨天" (yesterday)
+    m = re.match(r'昨天\s*(上午|下午)(\d{1,2}):(\d{2})', text)
+    if m:
+        period, h, mi = m.group(1), int(m.group(2)), int(m.group(3))
+        if period == '下午' and h != 12:
+            h += 12
+        elif period == '上午' and h == 12:
+            h = 0
+        d = reference_date - timedelta(days=1)
+        return d.replace(hour=h, minute=mi, second=0).isoformat(timespec='minutes')
+
+    # Weekday names: 週一..週日
+    weekday_map = {'週日': 6, '週一': 0, '週二': 1, '週三': 2, '週四': 3, '週五': 4, '週六': 5}
+    for name, wd in weekday_map.items():
+        if text.startswith(name):
+            # Find the most recent occurrence of this weekday
+            days_back = (reference_date.weekday() - wd) % 7
+            if days_back == 0:
+                days_back = 7  # if same weekday, it means last week
+            d = reference_date - timedelta(days=days_back)
+            # Try to extract time
+            m = re.search(r'(上午|下午)(\d{1,2}):(\d{2})', text)
+            if m:
+                period, h, mi = m.group(1), int(m.group(2)), int(m.group(3))
+                if period == '下午' and h != 12:
+                    h += 12
+                elif period == '上午' and h == 12:
+                    h = 0
+                return d.replace(hour=h, minute=mi, second=0).isoformat(timespec='minutes')
+            return d.strftime('%Y-%m-%d')
+
+    # "3月5日" or "3月5日 上午9:00"
+    m = re.match(r'(\d{1,2})月(\d{1,2})日\s*(上午|下午)?(\d{1,2})?:?(\d{2})?', text)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        year = reference_date.year
+        # If the month/day is in the future, it was last year
+        try:
+            d = reference_date.replace(month=month, day=day)
+            if d > reference_date:
+                d = d.replace(year=year - 1)
+        except ValueError:
+            return None
+        if m.group(3) and m.group(4) and m.group(5):
+            period = m.group(3)
+            h, mi = int(m.group(4)), int(m.group(5))
+            if period == '下午' and h != 12:
+                h += 12
+            elif period == '上午' and h == 12:
+                h = 0
+            return d.replace(hour=h, minute=mi, second=0).isoformat(timespec='minutes')
+        return d.strftime('%Y-%m-%d')
+
+    # "2026年3月5日"
+    m = re.match(r'(\d{4})年(\d{1,2})月(\d{1,2})日', text)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+    # Standalone "上午/下午 HH:MM"
+    m = re.match(r'(上午|下午)(\d{1,2}):(\d{2})$', text)
+    if m:
+        period, h, mi = m.group(1), int(m.group(2)), int(m.group(3))
+        if period == '下午' and h != 12:
+            h += 12
+        elif period == '上午' and h == 12:
+            h = 0
+        return reference_date.replace(hour=h, minute=mi, second=0).isoformat(timespec='minutes')
+
+    return None
+
+
+def _parse_raw_messages(raw_texts: list[str], my_name: str = "你") -> list[dict]:
+    """Parse raw row texts into structured messages.
+
+    Each raw text block may contain:
+    - Sender indicator ("你傳送了" = you sent, or contact name)
+    - Timestamp lines
+    - Message content
+    - UI artifacts to filter out
+    """
+    messages = []
+    # Patterns to skip (UI artifacts)
+    skip_patterns = re.compile(
+        r'^(進入|·|已收回|已讀|未讀|送出|傳送|轉傳|回覆|更多|表情|GIF|貼圖|相片|影片|語音|視訊|'
+        r'查看翻譯|翻譯|See translation|Translated|You sent|Sent|Delivered|Read|'
+        r'Unsent|More|Reply|React|Forward|GIF|Sticker|Photo|Video|Voice|Video call|'
+        r'\d+ others|其他 \d+ 人)$',
+        re.IGNORECASE
+    )
+
+    current_timestamp = None
+
+    for raw in raw_texts:
+        lines = [l.strip() for l in raw.split('\n') if l.strip()]
+        if not lines:
+            continue
+
+        # Try to find timestamp in the lines
+        for line in lines:
+            ts = _parse_timestamp(line)
+            if ts:
+                current_timestamp = ts
+
+        # Try to identify sender and content
+        sender = None
+        content_lines = []
+
+        for line in lines:
+            # Skip timestamps and UI artifacts
+            if _parse_timestamp(line):
+                continue
+            if skip_patterns.match(line):
+                continue
+            if len(line) <= 1:
+                continue
+
+            # Sender detection: "你傳送了" prefix means "you sent"
+            if '你傳送了' in line or line.startswith('你：'):
+                sender = my_name
+                # Extract content after the prefix if present
+                after = re.sub(r'^你(傳送了|：)\s*', '', line).strip()
+                if after:
+                    content_lines.append(after)
+                continue
+
+            # If no sender identified yet, the first meaningful line might be sender name
+            if sender is None:
+                # Check if this line could be a sender name (short, no special chars)
+                # In E2E threads, sender names appear as separate lines
+                if len(line) <= 30 and not re.search(r'[.!?。！？，,]', line):
+                    sender = line
+                    continue
+
+            content_lines.append(line)
+
+        content = '\n'.join(content_lines).strip()
+        if content:
+            messages.append({
+                'sender': sender or '(unknown)',
+                'text': content,
+                'timestamp': current_timestamp,
+            })
+
+    return messages
+
+
+async def _scroll_and_collect(page, days: int, max_scrolls: int = 300) -> list[str]:
+    """Scroll up in the message container, collecting raw row texts as we go.
+
+    Messenger virtualizes the DOM (removes old rows as you scroll), so we
+    must extract visible rows on each scroll iteration and deduplicate.
+
+    Returns deduplicated list of raw row texts in chronological order.
+    """
+    cutoff_date = datetime.now() - timedelta(days=days)
+    cutoff_str = cutoff_date.strftime('%Y-%m-%d')
+    print(f"Will scroll until messages older than {cutoff_str} are loaded...")
+
+    main_rows = page.locator('[role="main"] [role="row"]')
+    seen_texts = set()
+    all_texts = []  # ordered list of unique texts
+    scroll_count = 0
+    no_new_count = 0
+
+    async def _collect_visible():
+        """Collect currently visible row texts, return count of new ones."""
+        nonlocal no_new_count
+        count = await main_rows.count()
+        new_found = 0
+        for j in range(count):
+            try:
+                text = (await main_rows.nth(j).inner_text()).strip()
+                if text and text not in seen_texts:
+                    seen_texts.add(text)
+                    all_texts.append(text)
+                    new_found += 1
+            except Exception:
+                continue
+        return new_found
+
+    # Collect initial visible messages
+    await _collect_visible()
+
+    for i in range(max_scrolls):
+        # Scroll up
+        await page.evaluate('''() => {
+            const main = document.querySelector('[role="main"]');
+            if (!main) return;
+            let el = main.querySelector('[role="row"]');
+            while (el && el !== main) {
+                el = el.parentElement;
+                if (el && el.scrollHeight > el.clientHeight + 10) {
+                    el.scrollTop = Math.max(0, el.scrollTop - 800);
+                    return;
+                }
+            }
+            main.scrollTop = 0;
+        }''')
+        await page.wait_for_timeout(1000)
+
+        new_count = await _collect_visible()
+        scroll_count += 1
+
+        if new_count == 0:
+            no_new_count += 1
+        else:
+            no_new_count = 0
+
+        # Stop if no new messages after 8 consecutive scrolls
+        if no_new_count >= 8:
+            print(f"  No new messages after {no_new_count} scrolls. Stopping.")
+            break
+
+        # Check timestamps of newly collected texts for cutoff
+        reached_cutoff = False
+        for text in all_texts[-20:]:  # check recent additions
+            for line in text.split('\n'):
+                ts = _parse_timestamp(line.strip())
+                if ts and ts < cutoff_str:
+                    reached_cutoff = True
+                    break
+            if reached_cutoff:
+                break
+
+        if reached_cutoff:
+            print(f"  Reached messages older than {cutoff_str}. Done scrolling.")
+            break
+
+        if scroll_count % 20 == 0:
+            print(f"  Scrolled {scroll_count} times, {len(all_texts)} unique rows collected...")
+
+    print(f"  Total: {scroll_count} scrolls, {len(all_texts)} unique message rows collected.")
+    return all_texts
+
+
+async def scroll_and_extract_thread(
+    profile: str,
+    thread_id: str,
+    days: int = 30,
+    headless: bool = True,
+    output_file: str | None = None,
+):
+    """Scroll through a Messenger thread to load history, extract and save messages.
+
+    Opens the E2E thread, handles PIN dialog, scrolls up to load `days` worth
+    of messages, parses them into structured format, and saves to JSON.
+    """
+    p, browser, context = await create_browser_context(profile, headless)
+
+    try:
+        page = await context.new_page()
+
+        # Use E2E URL path for encrypted threads
+        if thread_id.isdigit():
+            url = f"https://www.facebook.com/messages/e2ee/t/{thread_id}/"
+        else:
+            url = f"https://www.facebook.com/messages/t/{thread_id}/"
+
+        print(f"Navigating to {url}...")
+        await page.goto(url, wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000)
+
+        if not await verify_login(page):
+            print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
+            sys.exit(1)
+
+        # Handle PIN dialog for E2E threads
+        await page.wait_for_timeout(2000)
+        await _dismiss_dialogs(page, profile)
+        await page.wait_for_timeout(2000)
+
+        # Scroll up and collect messages incrementally (DOM is virtualized)
+        print(f"Loading {days} days of message history...")
+        raw_texts = await _scroll_and_collect(page, days)
+
+        # Also dump raw texts for debugging
+        debug_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "profiles", profile, f"chat_raw_{thread_id}.json",
+        )
+        with open(debug_file, "w", encoding="utf-8") as f:
+            json.dump(raw_texts, f, ensure_ascii=False, indent=2)
+        print(f"  Raw texts saved to {debug_file}")
+
+        # Parse into structured messages
+        print("Parsing messages...")
+        messages = _parse_raw_messages(raw_texts)
+        print(f"  Parsed {len(messages)} messages.")
+
+        # Filter by date range
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec='minutes')
+        filtered = []
+        for msg in messages:
+            if msg['timestamp'] and msg['timestamp'] < cutoff:
+                continue
+            filtered.append(msg)
+
+        if len(filtered) < len(messages):
+            print(f"  After date filter: {len(filtered)} messages within {days} days.")
+            messages = filtered
+
+        # Determine output file
+        if not output_file:
+            base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            profile_dir = os.path.join(base, "profiles", profile)
+            os.makedirs(profile_dir, exist_ok=True)
+            output_file = os.path.join(profile_dir, f"chat_history_{thread_id}.json")
+
+        # Save to JSON
+        output_data = {
+            "thread_id": thread_id,
+            "extracted_at": datetime.now().isoformat(),
+            "days": days,
+            "message_count": len(messages),
+            "messages": messages,
+        }
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(output_data, f, ensure_ascii=False, indent=2)
+
+        print(f"\nSaved {len(messages)} messages to {output_file}")
+
+        # Print summary
+        senders = {}
+        for msg in messages:
+            s = msg['sender']
+            senders[s] = senders.get(s, 0) + 1
+        print("  Message counts by sender:")
+        for sender, count in sorted(senders.items(), key=lambda x: -x[1]):
+            print(f"    {sender}: {count}")
+
+        await save_storage_state(context, profile)
+        return output_file
+
+    finally:
+        await browser.close()
+        await p.stop()

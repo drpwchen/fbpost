@@ -1,10 +1,18 @@
 [project]
 name = "fbpost"
 version = "0.1.0"
-description = "Add your description here"
+description = "Facebook CLI tool — post, list comments, reply to comments"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "playwright>=1.49.0",
+    "playwright-stealth>=1.0.6",
     "python-dotenv>=1.2.2",
     "requests>=2.32.5",
 ]
+
+[project.scripts]
+fb = "scripts.fb:main"
+
+[tool.setuptools]
+packages = ["scripts"]
