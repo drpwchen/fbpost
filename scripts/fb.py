@@ -465,7 +465,7 @@ def cmd_send(args):
     """Send a Messenger message."""
     from scripts.fb_messenger import send_message, resolve_thread_id
     thread_id, _ = resolve_thread_id(args.profile, args.thread_id)
-    headless = not args.no_headless
+    headless = args.headless
     asyncio.run(send_message(args.profile, thread_id, args.text, headless))
 
 
@@ -505,6 +505,13 @@ def cmd_contacts(args):
     """List cached Messenger contacts."""
     from scripts.fb_messenger import list_contacts
     list_contacts(args.profile)
+
+
+def cmd_discover_e2ee(args):
+    """Discover and cache top E2E contacts from Messenger."""
+    from scripts.fb_messenger import discover_e2ee_contacts
+    headless = not args.no_headless
+    asyncio.run(discover_e2ee_contacts(args.profile, args.count, headless))
 
 
 def cmd_daemon(args):
@@ -553,7 +560,7 @@ def main():
     send_parser = subparsers.add_parser("send", help="Send a Messenger message")
     send_parser.add_argument("thread_id", help="Thread ID or contact name (from cache)")
     send_parser.add_argument("text", help="Message text")
-    send_parser.add_argument("--no-headless", action="store_true", help="Run in headed mode (visible browser)")
+    send_parser.add_argument("--headless", action="store_true", help="Run in headless mode (hidden browser)")
 
     # inbox
     inbox_parser = subparsers.add_parser("inbox", help="List Messenger inbox conversations")
@@ -574,6 +581,11 @@ def main():
 
     # contacts
     subparsers.add_parser("contacts", help="List cached Messenger contacts")
+
+    # discover-e2ee
+    e2ee_parser = subparsers.add_parser("discover-e2ee", help="Discover and cache top E2E contacts")
+    e2ee_parser.add_argument("--count", type=int, default=20, help="Number of E2E contacts to find (default: 20)")
+    e2ee_parser.add_argument("--no-headless", action="store_true", help="Run in headed mode")
 
     # daemon
     subparsers.add_parser("daemon", help="Start persistent browser for fast Messenger access")
@@ -605,6 +617,8 @@ def main():
         cmd_search(args)
     elif args.command == "contacts":
         cmd_contacts(args)
+    elif args.command == "discover-e2ee":
+        cmd_discover_e2ee(args)
     elif args.command == "daemon":
         cmd_daemon(args)
     elif args.command == "history":

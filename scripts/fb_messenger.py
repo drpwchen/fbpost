@@ -107,7 +107,7 @@ def list_contacts(profile: str):
 async def send_message(profile: str, thread_id: str, text: str, headless: bool = True):
     """Send a message to a Messenger thread."""
     is_daemon = False
-    p, browser, context = await create_browser_context(profile, headless, persistent=True)
+    p, browser, context = await create_browser_context(profile, headless, persistent=False)
 
     try:
         is_daemon = browser and getattr(browser, '_fbpost_daemon', False)
@@ -140,10 +140,18 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
             print(f"Reusing existing page for {thread_id}.")
             await page.bring_to_front()
         else:
+            # Navigate directly to the thread URL.
+            # For E2E: if input doesn't appear, the retry loop below
+            # will reload the page, which usually resolves encryption loading.
             print(f"Navigating to {url}...")
             await page.goto(url, wait_until="domcontentloaded")
-            # New thread may need PIN
-            await _dismiss_dialogs(page, profile)
+            await page.wait_for_timeout(4000)
+            # Handle PIN or other blocking dialogs
+            for _ in range(3):
+                if await _dismiss_dialogs(page, profile):
+                    await page.wait_for_timeout(2000)
+                else:
+                    break
 
         if not await verify_login(page):
             print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
@@ -152,60 +160,91 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
         # Wait for the message input OR PIN dialog
         print("Waiting for message input...")
 
-        for attempt in range(4):
+        input_box = None
+        for attempt in range(10):
             # Try multiple selectors for the input box
-            input_box = page.get_by_role("textbox", name="Message")
-            try:
-                await input_box.wait_for(state="visible", timeout=5000)
+            for selector_fn in [
+                lambda: page.get_by_role("textbox", name="Message"),
+                lambda: page.get_by_role("textbox", name="訊息"),
+                lambda: page.locator('[contenteditable="true"][role="textbox"]').first,
+            ]:
+                ib = selector_fn()
+                try:
+                    await ib.wait_for(state="visible", timeout=2000)
+                    input_box = ib
+                    break
+                except Exception:
+                    pass
+            if input_box:
                 break
-            except Exception:
-                pass
 
-            # Try zh-TW label
-            input_box = page.get_by_role("textbox", name="訊息")
-            try:
-                await input_box.wait_for(state="visible", timeout=2000)
-                break
-            except Exception:
-                pass
-
-            # Try generic contenteditable
-            input_box = page.locator('[contenteditable="true"][role="textbox"]').first
-            try:
-                await input_box.wait_for(state="visible", timeout=2000)
-                break
-            except Exception:
-                pass
-
-            # Maybe PIN dialog is blocking
+            # Maybe PIN dialog is blocking — keep trying
             if await _dismiss_dialogs(page, profile):
+                await page.wait_for_timeout(2000)
                 continue
 
-            if attempt == 3:
+            # Reload page to retry E2E decryption
+            if attempt in (2, 5):
+                print(f"  Input not found (attempt {attempt+1}), reloading...")
+                await page.goto(url, wait_until="domcontentloaded")
+                await page.wait_for_timeout(5000)
+                for _ in range(3):
+                    if await _dismiss_dialogs(page, profile):
+                        await page.wait_for_timeout(2000)
+                    else:
+                        break
+                continue
+
+            if attempt == 9:
                 print("Error: Could not find message input.", file=sys.stderr)
                 sys.exit(1)
 
-        # Count existing rows before sending (for daemon page reuse)
-        main_rows = page.locator('[role="main"] [role="row"]')
-        rows_before = await main_rows.count()
+        # Verify we're on the correct thread
+        if thread_id not in page.url:
+            print(f"WARNING: URL doesn't match thread {thread_id}!", file=sys.stderr)
+            print(f"  Current URL: {page.url}", file=sys.stderr)
 
-        # Use force click — E2E overlay may intercept pointer events
+        # Click the input and type the message
         await input_box.click(force=True)
+        await page.wait_for_timeout(500)
+
+        # Try fill first, verify text appeared, fallback to type()
         await input_box.fill(text)
-        await page.wait_for_timeout(200)
-        await input_box.press("Enter")
+        await page.wait_for_timeout(300)
 
-        # Wait for a new row to appear (row count increases after send)
         try:
-            await page.wait_for_function(
-                f"document.querySelectorAll('[role=\"main\"] [role=\"row\"]').length > {rows_before}",
-                timeout=8000,
-            )
+            input_text = await input_box.inner_text()
         except Exception:
-            # Fallback: longer wait for non-daemon (browser closes after)
-            await page.wait_for_timeout(3000 if not is_daemon else 1500)
+            input_text = ""
 
-        print(f"Message sent: \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
+        if text not in input_text:
+            print("  fill() failed, falling back to type()...")
+            await input_box.click(force=True)
+            await page.keyboard.press("Meta+a")
+            await page.keyboard.press("Backspace")
+            await page.wait_for_timeout(200)
+            await input_box.type(text, delay=30)
+            await page.wait_for_timeout(300)
+
+        await input_box.press("Enter")
+        await page.wait_for_timeout(5000)
+
+        # POST-SEND VERIFICATION: confirm message text appears in message rows
+        msg_rows = page.locator('[role="main"] [role="row"]')
+        rows_text = ""
+        row_count = await msg_rows.count()
+        # Check last 5 rows for the sent text
+        for i in range(max(0, row_count - 5), row_count):
+            try:
+                rows_text += await msg_rows.nth(i).inner_text() + "\n"
+            except Exception:
+                pass
+
+        if text in rows_text:
+            print(f"Message sent: \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
+        else:
+            print(f"Message likely sent (unverified): \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
+            print(f"  Could not confirm in DOM — do NOT retry, check manually first.", file=sys.stderr)
 
 
     finally:
@@ -243,13 +282,29 @@ async def _extract_conversations(page, count: int) -> list[dict]:
 
             # Try to get thread ID from an <a> link inside this row
             thread_id = ""
-            link = row.locator('a[href*="/messages/t/"]').first
+            e2ee = False
+            # Check E2E link first
+            e2ee_link = row.locator('a[href*="/messages/e2ee/t/"]').first
             try:
-                href = await link.get_attribute("href", timeout=1000) or ""
-                if "/messages/t/" in href:
-                    thread_id = href.split("/messages/t/")[-1].rstrip("/").split("?")[0]
+                href = await e2ee_link.get_attribute("href", timeout=500) or ""
+                if "/messages/e2ee/t/" in href:
+                    thread_id = href.split("/messages/e2ee/t/")[-1].rstrip("/").split("?")[0]
+                    e2ee = True
             except Exception:
                 pass
+
+            # Fallback to regular link
+            if not thread_id:
+                link = row.locator('a[href*="/messages/t/"]').first
+                try:
+                    href = await link.get_attribute("href", timeout=500) or ""
+                    if "/messages/e2ee/t/" in href:
+                        thread_id = href.split("/messages/e2ee/t/")[-1].rstrip("/").split("?")[0]
+                        e2ee = True
+                    elif "/messages/t/" in href:
+                        thread_id = href.split("/messages/t/")[-1].rstrip("/").split("?")[0]
+                except Exception:
+                    pass
 
             name = lines[0]
             preview = lines[1] if len(lines) > 1 else ""
@@ -260,6 +315,7 @@ async def _extract_conversations(page, count: int) -> list[dict]:
                 "preview": preview,
                 "time": time_str,
                 "thread_id": thread_id,
+                "e2ee": e2ee,
             })
         except Exception:
             continue
@@ -292,14 +348,150 @@ async def list_inbox(profile: str, count: int = 20, headless: bool = True):
 
         # Print results
         print()
-        print(f"  {'#':<4} {'Name':<25} {'Thread ID':<20} {'Preview'}")
-        print(f"  {'─' * 80}")
+        print(f"  {'#':<4} {'Name':<25} {'E2E':<5} {'Thread ID':<20} {'Preview'}")
+        print(f"  {'─' * 85}")
         for i, c in enumerate(conversations):
-            preview = c["preview"][:40] + ("..." if len(c["preview"]) > 40 else "")
+            preview = c["preview"][:35] + ("..." if len(c["preview"]) > 35 else "")
             tid = c["thread_id"][:18] if c["thread_id"] else "?"
-            print(f"  {i:<4} {c['name']:<25} {tid:<20} {preview}")
+            e2ee = "Yes" if c.get("e2ee") else ""
+            print(f"  {i:<4} {c['name']:<25} {e2ee:<5} {tid:<20} {preview}")
 
         print(f"\n  {len(conversations)} conversations shown.")
+
+        await save_storage_state(context, profile)
+
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+async def _scroll_sidebar(page, target_count: int, max_scrolls: int = 80) -> list[dict]:
+    """Scroll the Messenger sidebar to load more conversations.
+
+    Returns deduplicated list of conversations (up to target_count).
+    """
+    seen_ids = set()
+    all_convos = []
+    no_new_streak = 0
+
+    for scroll_i in range(max_scrolls):
+        convos = await _extract_conversations(page, target_count * 5)
+
+        new_count = 0
+        for c in convos:
+            key = c["thread_id"] or c["name"]
+            if key not in seen_ids:
+                seen_ids.add(key)
+                all_convos.append(c)
+                new_count += 1
+
+        if new_count > 0:
+            no_new_streak = 0
+        else:
+            no_new_streak += 1
+
+        if len(all_convos) >= target_count:
+            break
+
+        if no_new_streak >= 5:
+            break
+
+        # Scroll the sidebar down — try multiple strategies
+        scrolled = await page.evaluate('''() => {
+            // Strategy: find the scrollable container in the navigation area
+            const nav = document.querySelector('[role="navigation"]');
+            if (!nav) return false;
+
+            // Walk all descendants looking for the scrollable one
+            const candidates = nav.querySelectorAll('div');
+            for (const el of candidates) {
+                if (el.scrollHeight > el.clientHeight + 50) {
+                    const before = el.scrollTop;
+                    el.scrollTop += 500;
+                    if (el.scrollTop > before) return true;
+                }
+            }
+
+            // Fallback: scroll last visible row into view
+            const rows = nav.querySelectorAll('[role="row"]');
+            if (rows.length > 0) {
+                rows[rows.length - 1].scrollIntoView({ behavior: "instant", block: "end" });
+                return true;
+            }
+            return false;
+        }''')
+        await page.wait_for_timeout(1500)
+
+        if not scrolled:
+            # Try keyboard scroll: focus sidebar and press End/PageDown
+            try:
+                last_row = page.locator('div[role="navigation"] div[role="row"]').last
+                await last_row.scroll_into_view_if_needed()
+                await page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
+        if scroll_i % 10 == 9:
+            print(f"  Scrolled {scroll_i + 1} times, found {len(all_convos)} conversations...")
+
+    return all_convos
+
+
+async def discover_e2ee_contacts(
+    profile: str, count: int = 20, headless: bool = True
+):
+    """Discover top E2E encrypted contacts from Messenger sidebar and cache them.
+
+    Scrolls the sidebar to find E2E conversations, then saves them to the
+    contacts cache for quick access via name.
+    """
+    p, browser, context = await create_browser_context(profile, headless)
+
+    try:
+        page = await context.new_page()
+
+        print("Navigating to Messenger...")
+        await page.goto(
+            "https://www.facebook.com/messages/",
+            wait_until="domcontentloaded",
+        )
+        await page.wait_for_timeout(3000)
+
+        if not await verify_login(page):
+            print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
+            sys.exit(1)
+
+        # Handle any initial dialogs
+        await _dismiss_dialogs(page, profile)
+        await page.wait_for_timeout(2000)
+
+        print(f"Scanning sidebar for E2E contacts (target: {count})...")
+
+        # Scroll sidebar to collect enough conversations
+        # We need more than `count` total since not all are E2E
+        all_convos = await _scroll_sidebar(page, count * 5)
+
+        # Filter E2E only
+        e2ee_convos = [c for c in all_convos if c.get("e2ee") and c["thread_id"]]
+
+        print(f"\nFound {len(e2ee_convos)} E2E contacts out of {len(all_convos)} total conversations.")
+
+        # Cache them
+        cached = 0
+        for c in e2ee_convos[:count]:
+            _save_contact(profile, c["name"], c["thread_id"], e2ee=True)
+            cached += 1
+
+        # Print results
+        print()
+        print(f"  {'#':<4} {'Name':<25} {'Thread ID':<22} {'Preview'}")
+        print(f"  {'─' * 80}")
+        for i, c in enumerate(e2ee_convos[:count]):
+            preview = c.get("preview", "")[:35] + ("..." if len(c.get("preview", "")) > 35 else "")
+            print(f"  {i:<4} {c['name']:<25} {c['thread_id']:<22} {preview}")
+
+        print(f"\n  {len(e2ee_convos[:count])} E2E contacts found and cached.")
+        print(f"  Use 'fb send <name> \"message\"' to send messages by name.")
 
         await save_storage_state(context, profile)
 
