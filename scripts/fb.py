@@ -463,9 +463,10 @@ def cmd_login(args):
 
 def cmd_send(args):
     """Send a Messenger message."""
-    from scripts.fb_messenger import send_message
+    from scripts.fb_messenger import send_message, resolve_thread_id
+    thread_id, _ = resolve_thread_id(args.profile, args.thread_id)
     headless = not args.no_headless
-    asyncio.run(send_message(args.profile, args.thread_id, args.text, headless))
+    asyncio.run(send_message(args.profile, thread_id, args.text, headless))
 
 
 def cmd_inbox(args):
@@ -477,9 +478,10 @@ def cmd_inbox(args):
 
 def cmd_read(args):
     """Read messages from a Messenger thread."""
-    from scripts.fb_messenger import read_thread
+    from scripts.fb_messenger import read_thread, resolve_thread_id
+    thread_id, _ = resolve_thread_id(args.profile, args.thread_id)
     headless = not args.no_headless
-    asyncio.run(read_thread(args.profile, args.thread_id, args.count, headless))
+    asyncio.run(read_thread(args.profile, thread_id, args.count, headless))
 
 
 def cmd_search(args):
@@ -491,11 +493,18 @@ def cmd_search(args):
 
 def cmd_history(args):
     """Extract chat history from a Messenger thread by scrolling."""
-    from scripts.fb_messenger import scroll_and_extract_thread
+    from scripts.fb_messenger import scroll_and_extract_thread, resolve_thread_id
+    thread_id, _ = resolve_thread_id(args.profile, args.thread_id)
     headless = not args.no_headless
     asyncio.run(scroll_and_extract_thread(
-        args.profile, args.thread_id, args.days, headless, args.output,
+        args.profile, thread_id, args.days, headless, args.output,
     ))
+
+
+def cmd_contacts(args):
+    """List cached Messenger contacts."""
+    from scripts.fb_messenger import list_contacts
+    list_contacts(args.profile)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -536,7 +545,7 @@ def main():
 
     # send
     send_parser = subparsers.add_parser("send", help="Send a Messenger message")
-    send_parser.add_argument("thread_id", help="Messenger thread ID")
+    send_parser.add_argument("thread_id", help="Thread ID or contact name (from cache)")
     send_parser.add_argument("text", help="Message text")
     send_parser.add_argument("--no-headless", action="store_true", help="Run in headed mode (visible browser)")
 
@@ -547,7 +556,7 @@ def main():
 
     # read
     read_parser = subparsers.add_parser("read", help="Read messages from a Messenger thread")
-    read_parser.add_argument("thread_id", help="Messenger thread ID")
+    read_parser.add_argument("thread_id", help="Thread ID or contact name (from cache)")
     read_parser.add_argument("--count", type=int, default=20, help="Number of messages (default: 20)")
     read_parser.add_argument("--no-headless", action="store_true", help="Run in headed mode")
 
@@ -557,9 +566,12 @@ def main():
     search_parser.add_argument("--count", type=int, default=20, help="Number of messages (default: 20)")
     search_parser.add_argument("--no-headless", action="store_true", help="Run in headed mode")
 
+    # contacts
+    subparsers.add_parser("contacts", help="List cached Messenger contacts")
+
     # history (scroll and extract full chat history)
     history_parser = subparsers.add_parser("history", help="Extract chat history by scrolling through a thread")
-    history_parser.add_argument("thread_id", help="Messenger thread ID")
+    history_parser.add_argument("thread_id", help="Thread ID or contact name (from cache)")
     history_parser.add_argument("--days", type=int, default=30, help="Number of days of history (default: 30)")
     history_parser.add_argument("--output", help="Output JSON file path (default: profiles/<profile>/chat_history_<thread_id>.json)")
     history_parser.add_argument("--no-headless", action="store_true", help="Run in headed mode (visible browser)")
@@ -582,6 +594,8 @@ def main():
         cmd_read(args)
     elif args.command == "search":
         cmd_search(args)
+    elif args.command == "contacts":
+        cmd_contacts(args)
     elif args.command == "history":
         cmd_history(args)
 

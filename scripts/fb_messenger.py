@@ -15,6 +15,95 @@ from scripts.fb_browser import (
 )
 
 
+def _contacts_path(profile: str) -> str:
+    """Return path to the contacts cache file."""
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "profiles", profile, "contacts.json")
+
+
+def _load_contacts(profile: str) -> dict:
+    """Load cached contacts {name: {thread_id, e2ee, last_used}}."""
+    path = _contacts_path(profile)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_contact(profile: str, name: str, thread_id: str, e2ee: bool = False):
+    """Save or update a contact in the cache."""
+    contacts = _load_contacts(profile)
+    contacts[name] = {
+        "thread_id": thread_id,
+        "e2ee": e2ee,
+        "last_used": datetime.now().isoformat(),
+    }
+    path = _contacts_path(profile)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(contacts, f, ensure_ascii=False, indent=2)
+
+
+def resolve_thread_id(profile: str, name_or_id: str) -> tuple[str, bool]:
+    """Resolve a name or thread ID to (thread_id, is_e2ee).
+
+    If name_or_id looks like a thread ID (numeric), return it directly.
+    Otherwise, look up the contacts cache by name (fuzzy match).
+    Returns (thread_id, is_e2ee) or raises SystemExit if not found.
+    """
+    # Already a thread ID
+    if name_or_id.isdigit():
+        e2ee = len(name_or_id) > 15
+        return name_or_id, e2ee
+
+    # Look up in contacts cache
+    contacts = _load_contacts(profile)
+
+    # Exact match
+    if name_or_id in contacts:
+        c = contacts[name_or_id]
+        return c["thread_id"], c.get("e2ee", False)
+
+    # Fuzzy match — substring or partial
+    matches = []
+    for cname, cdata in contacts.items():
+        if name_or_id in cname or cname in name_or_id:
+            matches.append((cname, cdata))
+
+    if len(matches) == 1:
+        cname, cdata = matches[0]
+        print(f"Matched contact: {cname} → {cdata['thread_id']}")
+        return cdata["thread_id"], cdata.get("e2ee", False)
+    elif len(matches) > 1:
+        print("Multiple contacts match:", file=sys.stderr)
+        for cname, cdata in matches:
+            print(f"  {cname}: {cdata['thread_id']}", file=sys.stderr)
+        print("Be more specific.", file=sys.stderr)
+        sys.exit(1)
+
+    # Not found
+    print(f"Contact '{name_or_id}' not found in cache.", file=sys.stderr)
+    print("Use a thread ID directly, or run 'fb contacts' to see cached contacts.", file=sys.stderr)
+    print("Contacts are auto-cached when you use 'fb search' or 'fb read'.", file=sys.stderr)
+    sys.exit(1)
+
+
+def list_contacts(profile: str):
+    """Print cached contacts."""
+    contacts = _load_contacts(profile)
+    if not contacts:
+        print("No cached contacts. Use 'fb search <name>' to discover and cache threads.")
+        return
+
+    print(f"\n  {'Name':<25} {'Thread ID':<22} {'E2E':<5} {'Last Used'}")
+    print(f"  {'─' * 75}")
+    for name, data in sorted(contacts.items(), key=lambda x: x[1].get("last_used", ""), reverse=True):
+        e2ee = "Yes" if data.get("e2ee") else "No"
+        last = data.get("last_used", "")[:10]
+        print(f"  {name:<25} {data['thread_id']:<22} {e2ee:<5} {last}")
+    print(f"\n  {len(contacts)} contacts cached.")
+
+
 async def send_message(profile: str, thread_id: str, text: str, headless: bool = True):
     """Send a message to a Messenger thread."""
     p, browser, context = await create_browser_context(profile, headless)
@@ -283,8 +372,17 @@ async def search_and_read(
         # Get thread ID from URL
         current_url = page.url
         thread_id = ""
-        if "/messages/t/" in current_url:
+        e2ee = False
+        if "/messages/e2ee/t/" in current_url:
+            thread_id = current_url.split("/messages/e2ee/t/")[-1].rstrip("/").split("?")[0]
+            e2ee = True
+        elif "/messages/t/" in current_url:
             thread_id = current_url.split("/messages/t/")[-1].rstrip("/").split("?")[0]
+
+        # Cache the discovered contact
+        if thread_id:
+            _save_contact(profile, query, thread_id, e2ee)
+            print(f"Cached contact: {query} → {thread_id} (E2E: {e2ee})")
 
         print(f"Opened thread: {thread_id or '(unknown)'}")
         print("Reading messages...")
