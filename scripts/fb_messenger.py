@@ -202,8 +202,8 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
                 timeout=8000,
             )
         except Exception:
-            # Fallback: brief wait
-            await page.wait_for_timeout(1500)
+            # Fallback: longer wait for non-daemon (browser closes after)
+            await page.wait_for_timeout(3000 if not is_daemon else 1500)
 
         print(f"Message sent: \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
 
