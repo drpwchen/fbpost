@@ -204,11 +204,10 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
             print(f"WARNING: URL doesn't match thread {thread_id}!", file=sys.stderr)
             print(f"  Current URL: {page.url}", file=sys.stderr)
 
-        # Click the input and type the message
+        # PRE-SEND: fill text and verify it's in the input before pressing Enter
         await input_box.click(force=True)
         await page.wait_for_timeout(500)
 
-        # Try fill first, verify text appeared, fallback to type()
         await input_box.fill(text)
         await page.wait_for_timeout(300)
 
@@ -226,25 +225,20 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
             await input_box.type(text, delay=30)
             await page.wait_for_timeout(300)
 
-        await input_box.press("Enter")
-        await page.wait_for_timeout(5000)
-
-        # POST-SEND VERIFICATION: confirm message text appears in message rows
-        msg_rows = page.locator('[role="main"] [role="row"]')
-        rows_text = ""
-        row_count = await msg_rows.count()
-        # Check last 5 rows for the sent text
-        for i in range(max(0, row_count - 5), row_count):
             try:
-                rows_text += await msg_rows.nth(i).inner_text() + "\n"
+                input_text = await input_box.inner_text()
             except Exception:
-                pass
+                input_text = ""
 
-        if text in rows_text:
-            print(f"Message sent: \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
-        else:
-            print(f"Message likely sent (unverified): \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
-            print(f"  Could not confirm in DOM — do NOT retry, check manually first.", file=sys.stderr)
+        if text not in input_text:
+            print(f"FAILED: text not in input box. Aborting send.", file=sys.stderr)
+            sys.exit(1)
+
+        # Text confirmed in input — send it
+        await input_box.press("Enter")
+        await page.wait_for_timeout(3000)
+        print(f"Message sent: \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
+
 
 
     finally:
