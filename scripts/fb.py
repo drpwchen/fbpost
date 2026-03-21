@@ -507,6 +507,12 @@ def cmd_contacts(args):
     list_contacts(args.profile)
 
 
+def cmd_daemon(args):
+    """Start persistent browser daemon for fast Messenger access."""
+    from scripts.fb_browser import start_daemon
+    asyncio.run(start_daemon(args.profile))
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -569,6 +575,9 @@ def main():
     # contacts
     subparsers.add_parser("contacts", help="List cached Messenger contacts")
 
+    # daemon
+    subparsers.add_parser("daemon", help="Start persistent browser for fast Messenger access")
+
     # history (scroll and extract full chat history)
     history_parser = subparsers.add_parser("history", help="Extract chat history by scrolling through a thread")
     history_parser.add_argument("thread_id", help="Thread ID or contact name (from cache)")
@@ -596,6 +605,8 @@ def main():
         cmd_search(args)
     elif args.command == "contacts":
         cmd_contacts(args)
+    elif args.command == "daemon":
+        cmd_daemon(args)
     elif args.command == "history":
         cmd_history(args)
 

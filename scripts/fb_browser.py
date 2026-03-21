@@ -1,5 +1,6 @@
 """Playwright browser management — cookie injection, login capture, stealth."""
 
+import asyncio
 import json
 import os
 import sys
@@ -85,17 +86,105 @@ def _user_data_dir(profile: str) -> str:
     return os.path.join(_profile_dir(profile), "chromium_data")
 
 
-async def connect_to_running_chrome(p):
-    """Try to connect to a running Chrome with remote debugging on port 9222.
+CDP_PORT = 9222
+CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
+_DAEMON_PID_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".daemon.pid")
 
-    Start Chrome with: /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222
-    Returns browser or None.
+
+async def connect_to_daemon(p):
+    """Try to connect to the fbpost daemon browser via CDP.
+
+    Returns (browser, context) or (None, None).
     """
     try:
-        browser = await p.chromium.connect_over_cdp("http://127.0.0.1:9222", timeout=2000)
-        return browser
+        browser = await p.chromium.connect_over_cdp(CDP_URL, timeout=2000)
+        # Reuse existing context (has cookies already)
+        context = browser.contexts[0] if browser.contexts else None
+        return browser, context
     except Exception:
-        return None
+        return None, None
+
+
+async def start_daemon(profile: str):
+    """Start a persistent headless Chromium that stays running for fast access.
+
+    Other commands connect to it via CDP, skipping cold start entirely.
+    """
+    import signal
+
+    p = await async_playwright().start()
+
+    # Check if already running
+    browser, _ = await connect_to_daemon(p)
+    if browser:
+        print(f"Daemon already running on port {CDP_PORT}.")
+        await p.stop()
+        return
+
+    user_data = _user_data_dir(profile)
+    os.makedirs(user_data, exist_ok=True)
+    storage_path = _storage_state_path(profile)
+
+    print(f"Starting fbpost daemon on port {CDP_PORT}...")
+
+    # Launch with remote debugging enabled
+    browser = await p.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            f"--remote-debugging-port={CDP_PORT}",
+        ],
+    )
+
+    ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+
+    if os.path.exists(storage_path):
+        context = await browser.new_context(
+            storage_state=storage_path,
+            viewport={"width": 1920, "height": 1080},
+            user_agent=ua,
+        )
+    else:
+        context = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=ua,
+        )
+        pw_cookies = convert_cookies(profile)
+        await context.add_cookies(pw_cookies)
+
+    await stealth.apply_stealth_async(context)
+
+    # Pre-warm: navigate to Messenger so first send is instant
+    page = await context.new_page()
+    print("Pre-warming Messenger...")
+    await page.goto("https://www.facebook.com/messages/", wait_until="domcontentloaded")
+    await page.wait_for_timeout(3000)
+
+    # Handle any PIN dialog
+    await handle_pin_dialog(page, profile)
+
+    # Save PID
+    with open(_DAEMON_PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    print(f"Daemon ready (PID {os.getpid()}). Commands will auto-connect.")
+    print("Press Ctrl+C to stop.")
+
+    # Keep alive until interrupted
+    stop = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+
+    await stop.wait()
+
+    print("\nStopping daemon...")
+    if os.path.exists(_DAEMON_PID_FILE):
+        os.remove(_DAEMON_PID_FILE)
+    await save_storage_state(context, profile)
+    await browser.close()
+    await p.stop()
+    print("Daemon stopped.")
 
 
 async def create_browser_context(profile: str, headless: bool = True, persistent: bool = False):
@@ -115,16 +204,13 @@ async def create_browser_context(profile: str, headless: bool = True, persistent
 
     ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 
-    # Try to connect to running Chrome first (fastest path)
-    if not headless:
-        browser = await connect_to_running_chrome(p)
-        if browser:
-            context = browser.contexts[0] if browser.contexts else await browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent=ua,
-            )
-            print("Connected to running Chrome (CDP).")
-            return p, browser, context
+    # Try to connect to daemon first (fastest path — no cold start)
+    browser, context = await connect_to_daemon(p)
+    if browser and context:
+        print("Connected to daemon.")
+        # Mark browser so callers know not to close it
+        browser._fbpost_daemon = True
+        return p, browser, context
 
     if persistent:
         user_data = _user_data_dir(profile)

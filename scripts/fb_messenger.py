@@ -106,64 +106,107 @@ def list_contacts(profile: str):
 
 async def send_message(profile: str, thread_id: str, text: str, headless: bool = True):
     """Send a message to a Messenger thread."""
+    is_daemon = False
     p, browser, context = await create_browser_context(profile, headless, persistent=True)
 
     try:
-        # Reuse existing page or create new one
-        pages = context.pages
-        page = pages[0] if pages else await context.new_page()
+        is_daemon = browser and getattr(browser, '_fbpost_daemon', False)
 
         if thread_id.isdigit() and len(thread_id) > 15:
             url = f"https://www.facebook.com/messages/e2ee/t/{thread_id}/"
         else:
             url = f"https://www.facebook.com/messages/t/{thread_id}/"
-        print(f"Navigating to {url}...")
-        await page.goto(url, wait_until="domcontentloaded")
+
+        # For daemon: try to find an existing page already on this thread
+        page = None
+        if is_daemon:
+            for pg in context.pages:
+                if thread_id in pg.url:
+                    page = pg
+                    break
+            if not page and context.pages:
+                page = context.pages[0]
+
+        if not page:
+            page = await context.new_page()
+
+        # Navigate (skip if already on the right thread)
+        if thread_id not in page.url:
+            print(f"Navigating to {url}...")
+            await page.goto(url, wait_until="domcontentloaded")
+        else:
+            print(f"Reusing existing page for {thread_id}.")
+            # Re-focus the page to ensure input is interactive
+            await page.bring_to_front()
+            await page.wait_for_timeout(300)
 
         if not await verify_login(page):
             print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
             sys.exit(1)
 
-        # Wait for the message input OR PIN dialog (race condition)
+        # Wait for the message input OR PIN dialog
         print("Waiting for message input...")
-        input_box = page.get_by_role("textbox", name="Message")
-        pin_input = page.locator('input[aria-label*="PIN"], input[aria-label*="pin"]').first
 
-        # Race: wait for either input box or PIN dialog
-        for attempt in range(3):
+        for attempt in range(4):
+            # Try multiple selectors for the input box
+            input_box = page.get_by_role("textbox", name="Message")
             try:
                 await input_box.wait_for(state="visible", timeout=5000)
-                break  # input ready
+                break
             except Exception:
-                # Check if PIN dialog appeared
-                if await _dismiss_dialogs(page, profile):
-                    # PIN was entered, wait for input again
-                    continue
-                if attempt == 2:
-                    # Last resort: try contenteditable
-                    input_box = page.locator('[contenteditable="true"][role="textbox"]').first
-                    await input_box.wait_for(state="visible", timeout=5000)
+                pass
 
-        # Fill and send
-        await input_box.click()
+            # Try zh-TW label
+            input_box = page.get_by_role("textbox", name="訊息")
+            try:
+                await input_box.wait_for(state="visible", timeout=2000)
+                break
+            except Exception:
+                pass
+
+            # Try generic contenteditable
+            input_box = page.locator('[contenteditable="true"][role="textbox"]').first
+            try:
+                await input_box.wait_for(state="visible", timeout=2000)
+                break
+            except Exception:
+                pass
+
+            # Maybe PIN dialog is blocking
+            if await _dismiss_dialogs(page, profile):
+                continue
+
+            if attempt == 3:
+                print("Error: Could not find message input.", file=sys.stderr)
+                sys.exit(1)
+
+        # Count existing rows before sending (for daemon page reuse)
+        main_rows = page.locator('[role="main"] [role="row"]')
+        rows_before = await main_rows.count()
+
+        # Use force click — E2E overlay may intercept pointer events
+        await input_box.click(force=True)
         await input_box.fill(text)
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(200)
         await input_box.press("Enter")
 
-        # Wait for message to actually appear in the thread before closing
-        # Look for our text in a sent message row
+        # Wait for a new row to appear (row count increases after send)
         try:
-            sent_indicator = page.locator(f'[role="main"] [role="row"]:has-text("{text[:30]}")')
-            await sent_indicator.wait_for(state="attached", timeout=8000)
+            await page.wait_for_function(
+                f"document.querySelectorAll('[role=\"main\"] [role=\"row\"]').length > {rows_before}",
+                timeout=8000,
+            )
         except Exception:
-            # Fallback: fixed wait if we can't detect the sent message
-            await page.wait_for_timeout(3000)
+            # Fallback: brief wait
+            await page.wait_for_timeout(1500)
 
         print(f"Message sent: \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
 
 
     finally:
-        if browser:
+        if is_daemon:
+            pass  # keep browser + page alive for reuse
+        elif browser:
             await browser.close()
         else:
             await context.close()
