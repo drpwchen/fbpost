@@ -95,13 +95,121 @@ def list_contacts(profile: str):
         print("No cached contacts. Use 'fb search <name>' to discover and cache threads.")
         return
 
-    print(f"\n  {'Name':<25} {'Thread ID':<22} {'E2E':<5} {'Last Used'}")
-    print(f"  {'─' * 75}")
+    print(f"\n  {'Name':<25} {'Thread ID':<22} {'E2E':<5} {'Type':<6} {'Last Used'}")
+    print(f"  {'─' * 85}")
     for name, data in sorted(contacts.items(), key=lambda x: x[1].get("last_used", ""), reverse=True):
         e2ee = "Yes" if data.get("e2ee") else "No"
+        ctype = data.get("type", "")
         last = data.get("last_used", "")[:10]
-        print(f"  {name:<25} {data['thread_id']:<22} {e2ee:<5} {last}")
+        print(f"  {name:<25} {data['thread_id']:<22} {e2ee:<5} {ctype:<6} {last}")
     print(f"\n  {len(contacts)} contacts cached.")
+
+
+async def verify_contacts(profile: str, count: int = 20, headless: bool = True):
+    """Verify cached E2E contacts by reading thread headers.
+
+    Opens each thread briefly to check if it's 1-on-1 or group,
+    then updates the contacts cache with the type.
+    """
+    contacts = _load_contacts(profile)
+    e2ee_contacts = [
+        (name, data) for name, data in contacts.items()
+        if data.get("e2ee") and not data.get("type")
+    ]
+    # Sort by last_used descending
+    e2ee_contacts.sort(key=lambda x: x[1].get("last_used", ""), reverse=True)
+    e2ee_contacts = e2ee_contacts[:count]
+
+    if not e2ee_contacts:
+        print("No unverified E2E contacts to check.")
+        return
+
+    p, browser, context = await create_browser_context(profile, headless)
+
+    try:
+        page = await context.new_page()
+
+        # Go to Messenger first to handle PIN
+        print("Loading Messenger...")
+        await page.goto("https://www.facebook.com/messages/", wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000)
+        for _ in range(3):
+            if await _dismiss_dialogs(page, profile):
+                await page.wait_for_timeout(2000)
+            else:
+                break
+
+        if not await verify_login(page):
+            print("Error: Not logged in.", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"Verifying {len(e2ee_contacts)} contacts...\n")
+        print(f"  {'#':<4} {'Name':<25} {'Type':<8} {'Members'}")
+        print(f"  {'─' * 70}")
+
+        for i, (name, data) in enumerate(e2ee_contacts):
+            tid = data["thread_id"]
+            url = f"https://www.facebook.com/messages/e2ee/t/{tid}/"
+
+            try:
+                await page.goto(url, wait_until="domcontentloaded")
+                await page.wait_for_timeout(3000)
+                await _dismiss_dialogs(page, profile)
+                await page.wait_for_timeout(1000)
+
+                # Check thread header for participant count
+                # 1-on-1: shows single name; Group: shows member names/count
+                header = page.locator('[role="main"] h2, [role="main"] h3').first
+                try:
+                    header_text = await header.inner_text(timeout=3000)
+                except Exception:
+                    header_text = ""
+
+                # Check for group indicators in the page
+                members_el = page.locator('text=/\\d+ 位成員|\\d+ members/i').first
+                try:
+                    members_text = await members_el.inner_text(timeout=1000)
+                    ctype = "group"
+                except Exception:
+                    members_text = ""
+                    # Read a few messages to check sender diversity
+                    msg_rows = page.locator('[role="main"] [role="row"]')
+                    row_count = await msg_rows.count()
+                    senders = set()
+                    for j in range(min(row_count, 10)):
+                        try:
+                            row_text = await msg_rows.nth(j).inner_text()
+                            lines = [l.strip() for l in row_text.split('\n') if l.strip()]
+                            if lines and len(lines[0]) <= 30:
+                                senders.add(lines[0])
+                        except Exception:
+                            pass
+                    # Filter out common non-sender lines
+                    senders -= {'', '你傳送了', '進入', '載入中……'}
+                    ctype = "dm" if len(senders) <= 2 else "group"
+                    members_text = ", ".join(list(senders)[:3])
+
+                # Update contact cache
+                contacts[name]["type"] = ctype
+                print(f"  {i:<4} {name:<25} {ctype:<8} {members_text[:35]}")
+
+            except Exception as e:
+                print(f"  {i:<4} {name:<25} {'error':<8} {str(e)[:35]}")
+
+        # Save updated contacts
+        path = _contacts_path(profile)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(contacts, f, ensure_ascii=False, indent=2)
+
+        dm_count = sum(1 for n, d in e2ee_contacts if contacts[n].get("type") == "dm")
+        group_count = sum(1 for n, d in e2ee_contacts if contacts[n].get("type") == "group")
+        print(f"\n  Verified: {dm_count} DM, {group_count} group")
+
+        await save_storage_state(context, profile)
+
+    finally:
+        await browser.close()
+        await p.stop()
 
 
 async def send_message(profile: str, thread_id: str, text: str, headless: bool = True):
@@ -199,10 +307,10 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
                 print("Error: Could not find message input.", file=sys.stderr)
                 sys.exit(1)
 
-        # Verify we're on the correct thread
+        # Verify we're on the correct thread — abort if wrong
         if thread_id not in page.url:
-            print(f"WARNING: URL doesn't match thread {thread_id}!", file=sys.stderr)
-            print(f"  Current URL: {page.url}", file=sys.stderr)
+            print(f"ABORT: wrong thread! Expected {thread_id}, got {page.url}", file=sys.stderr)
+            sys.exit(1)
 
         # PRE-SEND: fill text and verify it's in the input before pressing Enter
         await input_box.click(force=True)

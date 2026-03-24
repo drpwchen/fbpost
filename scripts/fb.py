@@ -514,6 +514,13 @@ def cmd_discover_e2ee(args):
     asyncio.run(discover_e2ee_contacts(args.profile, args.count, headless))
 
 
+def cmd_verify_contacts(args):
+    """Verify cached E2E contacts (1-on-1 vs group)."""
+    from scripts.fb_messenger import verify_contacts
+    headless = not args.no_headless
+    asyncio.run(verify_contacts(args.profile, args.count, headless))
+
+
 def cmd_daemon(args):
     """Start persistent browser daemon for fast Messenger access."""
     from scripts.fb_browser import start_daemon
@@ -587,6 +594,11 @@ def main():
     e2ee_parser.add_argument("--count", type=int, default=20, help="Number of E2E contacts to find (default: 20)")
     e2ee_parser.add_argument("--no-headless", action="store_true", help="Run in headed mode")
 
+    # verify-contacts
+    verify_parser = subparsers.add_parser("verify-contacts", help="Verify E2E contacts (1-on-1 vs group)")
+    verify_parser.add_argument("--count", type=int, default=20, help="Number of contacts to verify (default: 20)")
+    verify_parser.add_argument("--no-headless", action="store_true", help="Run in headed mode")
+
     # daemon
     subparsers.add_parser("daemon", help="Start persistent browser for fast Messenger access")
 
@@ -619,6 +631,8 @@ def main():
         cmd_contacts(args)
     elif args.command == "discover-e2ee":
         cmd_discover_e2ee(args)
+    elif args.command == "verify-contacts":
+        cmd_verify_contacts(args)
     elif args.command == "daemon":
         cmd_daemon(args)
     elif args.command == "history":
