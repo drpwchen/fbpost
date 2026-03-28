@@ -1,3 +1,7 @@
+![GitHub stars](https://img.shields.io/github/stars/htlin222/fbpost?style=flat-square)
+![Last commit](https://img.shields.io/github/last-commit/htlin222/fbpost?style=flat-square)
+![License](https://img.shields.io/github/license/htlin222/fbpost?style=flat-square)
+
 # fbpost
 
 Facebook CLI tool — post, comments, replies, and Messenger automation via GraphQL API + Playwright.
