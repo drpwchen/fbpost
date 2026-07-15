@@ -37,6 +37,19 @@ def _last_comments_file(profile: str = "default") -> str:
 
 def cmd_post(args):
     """Post text to Facebook."""
+    if args.image or args.schedule:
+        # Photo attachment and scheduling aren't supported by the raw
+        # GraphQL mutation below — drive the real composer UI instead.
+        from scripts.fb_browser import post_via_composer
+        asyncio.run(post_via_composer(
+            args.profile, args.text,
+            image_path=args.image,
+            schedule_at=args.schedule,
+            privacy=args.privacy,
+            headless=args.headless,
+        ))
+        return
+
     cookies = load_cookies(args.profile)
     actor_id = cookies["actor_id"]
     session = create_session(cookies)
@@ -543,6 +556,16 @@ def main():
     post_parser.add_argument(
         "--privacy", choices=["EVERYONE", "FRIENDS", "SELF"],
         default="SELF", help="Privacy setting (default: SELF)",
+    )
+    post_parser.add_argument(
+        "--image", help="Path to an image to attach (routes through the browser composer, not the GraphQL fast path)",
+    )
+    post_parser.add_argument(
+        "--schedule", help="Schedule for later, 'YYYY-MM-DD HH:MM' 24hr (routes through the browser composer)",
+    )
+    post_parser.add_argument(
+        "--headless", action="store_true",
+        help="Run headless when --image/--schedule is used (default: headed)",
     )
 
     # comments

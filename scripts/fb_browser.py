@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+from datetime import datetime
 
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
@@ -428,3 +429,181 @@ async def capture_login(profile: str):
     await browser.close()
     await p.stop()
     print("Done! You can now use other commands.")
+
+
+_PRIVACY_LABELS = {
+    "EVERYONE": "所有人",
+    "FRIENDS": "朋友",
+    "SELF": "只限本人",
+}
+
+
+async def post_via_composer(
+    profile: str,
+    text: str,
+    image_path: str = None,
+    schedule_at: str = None,
+    privacy: str = "EVERYONE",
+    headless: bool = True,
+):
+    """Post to Facebook via the browser composer UI.
+
+    Used instead of the fast GraphQL path (cmd_post in fb.py) whenever a
+    photo attachment or a scheduled publish time is requested — neither is
+    supported by the raw ComposerStoryCreateMutation payload this tool
+    otherwise sends, so we drive the real composer like a human would.
+    """
+    p, browser, context = await create_browser_context(profile, headless, persistent=False)
+
+    try:
+        page = await context.new_page()
+        await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(4000)
+
+        if not await verify_login(page):
+            print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
+            sys.exit(1)
+
+        # Open the composer (label varies EN/zh-TW)
+        opened = False
+        for label in ["What's on your mind", "在想些什麼"]:
+            try:
+                await page.get_by_text(label, exact=False).first.click(timeout=5000)
+                opened = True
+                break
+            except Exception:
+                continue
+        if not opened:
+            print("Error: Could not open the composer (post box not found).", file=sys.stderr)
+            sys.exit(1)
+        await page.wait_for_timeout(3000)
+
+        dialog = page.get_by_role("dialog").first
+
+        # PRE-SEND style verification: type text and confirm it landed before
+        # doing anything else (same discipline as send_message in fb_messenger.py).
+        textbox = dialog.get_by_role("textbox").first
+        await textbox.click(timeout=5000)
+        await textbox.type(text, delay=20, timeout=15000)
+        await page.wait_for_timeout(500)
+        try:
+            input_text = await textbox.inner_text()
+        except Exception:
+            input_text = ""
+        if text not in input_text:
+            print("FAILED: post text not confirmed in composer box. Aborting.", file=sys.stderr)
+            sys.exit(1)
+
+        if image_path:
+            if not os.path.isfile(image_path):
+                print(f"Error: image file not found: {image_path}", file=sys.stderr)
+                sys.exit(1)
+            file_input = dialog.locator('input[type="file"]').first
+            await file_input.set_input_files(os.path.abspath(image_path), timeout=15000)
+            try:
+                await dialog.get_by_text("已上傳的影音內容", exact=False).first.wait_for(
+                    state="visible", timeout=20000
+                )
+                print("Photo attached.")
+            except Exception:
+                print("FAILED: photo did not appear to attach (upload indicator never showed).", file=sys.stderr)
+                sys.exit(1)
+
+        # Audience/privacy — always set explicitly rather than trusting
+        # whatever FB last remembered as the default.
+        target_label = _PRIVACY_LABELS.get(privacy, "所有人")
+        audience_row = dialog.get_by_text("貼文分享對象", exact=False).first
+        await audience_row.click(timeout=8000)
+        await page.wait_for_timeout(1500)
+        privacy_dialogs = page.get_by_role("dialog")
+        pd_count = await privacy_dialogs.count()
+        privacy_modal = privacy_dialogs.nth(pd_count - 1)
+        await privacy_modal.get_by_text(target_label, exact=True).first.click(timeout=5000)
+        await page.wait_for_timeout(500)
+        await privacy_modal.get_by_text("完成", exact=True).first.click(timeout=5000)
+        await page.wait_for_timeout(1000)
+
+        if schedule_at:
+            try:
+                dt = datetime.strptime(schedule_at, "%Y-%m-%d %H:%M")
+            except ValueError:
+                print(
+                    f"Error: --schedule must be 'YYYY-MM-DD HH:MM' (24hr), got {schedule_at!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if dt <= datetime.now():
+                print("Error: --schedule time must be in the future.", file=sys.stderr)
+                sys.exit(1)
+            date_str = f"{dt.year}年{dt.month}月{dt.day}日"
+            time_str = dt.strftime("%H:%M")
+
+            await dialog.get_by_text("排程", exact=True).first.click(timeout=8000)
+            await page.wait_for_timeout(2000)
+
+            heading = page.get_by_text("排程選項", exact=True).first
+            await heading.wait_for(state="visible", timeout=8000)
+            schedule_container = heading.locator(
+                "xpath=ancestor::*[.//text()[contains(.,'日期')] and .//text()[contains(.,'時間')]][1]"
+            )
+            schedule_inputs = schedule_container.locator("input")
+            await schedule_inputs.nth(0).fill(date_str, timeout=5000)
+            await page.wait_for_timeout(500)
+            await schedule_inputs.nth(1).fill(time_str, timeout=5000)
+            await page.wait_for_timeout(500)
+
+            confirm_btn = schedule_container.locator('div[role="button"][aria-label="排定稍後通話"]').first
+            try:
+                await confirm_btn.wait_for(state="visible", timeout=5000)
+            except Exception:
+                # Upstream label may change; fall back to any enabled button
+                # in the schedule container that isn't the close/date-picker button.
+                confirm_btn = schedule_container.locator(
+                    'div[role="button"]:not([aria-label*="關閉"]):not([aria-label*="日期"])'
+                ).last
+            await confirm_btn.click(timeout=8000)
+            await page.wait_for_timeout(2000)
+
+            # This confirm button only closes the date/time popup and stores
+            # the chosen time on the composer — it does NOT submit anything.
+            # Confirmed by inspection: after it closes, the composer's main
+            # action button relabels from "發佈" to "設定貼文發佈時間"
+            # ("Set post publish time"), and THAT is the real submit button.
+            # A prior version of this function stopped after the popup
+            # confirm and reported "scheduled" even though nothing was ever
+            # sent — the draft just sat open until the browser closed.
+            finalize_btn = dialog.get_by_text("設定貼文發佈時間", exact=True).first
+            await finalize_btn.wait_for(state="visible", timeout=5000)
+            await finalize_btn.click(timeout=8000)
+            await page.wait_for_timeout(3000)
+
+            # POST-SEND verification: the composer dialog should be gone once
+            # the scheduled post is actually accepted. If it's still open,
+            # nothing was submitted — report failure instead of guessing.
+            still_open = await dialog.count() and await dialog.is_visible()
+            if still_open:
+                print(
+                    "FAILED: composer still open after clicking 設定貼文發佈時間 — "
+                    "post was NOT scheduled.", file=sys.stderr,
+                )
+                sys.exit(1)
+            print(f"Post scheduled for {date_str} {time_str}.")
+        else:
+            publish_btn = dialog.get_by_text("發佈", exact=True).first
+            await publish_btn.click(timeout=8000)
+            await page.wait_for_timeout(3000)
+
+            still_open = await dialog.count() and await dialog.is_visible()
+            if still_open:
+                print(
+                    "FAILED: composer still open after clicking 發佈 — post was NOT published.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            print("Post published.")
+
+        await save_storage_state(context, profile)
+
+    finally:
+        await browser.close()
+        await p.stop()
