@@ -8,7 +8,7 @@ import sys
 import requests
 from dotenv import dotenv_values
 
-from scripts.fb_config import STORY_VIEW_DOC_ID
+from scripts.fb_config import FB_USER_AGENT, STORY_VIEW_DOC_ID
 
 
 GRAPHQL_URL = "https://www.facebook.com/api/graphql/"
@@ -166,7 +166,7 @@ def create_session(cookies: dict[str, str]) -> requests.Session:
     session = requests.Session()
     session.cookies.update(cookies)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+        "User-Agent": FB_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate",
@@ -282,12 +282,23 @@ def graphql_request(
         print(resp.text[:500], file=sys.stderr)
         sys.exit(1)
 
+    def _check_graphql_errors(data):
+        # An HTTP 200 can still carry a GraphQL-level failure (expired
+        # token, rate limit, permission). Returning it as success makes
+        # callers read empty `data` and report nothing wrong.
+        if isinstance(data, dict) and data.get("errors") and not data.get("data"):
+            print("Error: GraphQL request failed:", file=sys.stderr)
+            for err in data["errors"]:
+                print(f"  {err.get('message', err)}", file=sys.stderr)
+            sys.exit(1)
+        return data
+
     body = resp.text
     if body.startswith("for (;;);"):
         body = body[len("for (;;);"):]
 
     try:
-        return json.loads(body)
+        return _check_graphql_errors(json.loads(body))
     except json.JSONDecodeError:
         for line in body.strip().split("\n"):
             line = line.strip()

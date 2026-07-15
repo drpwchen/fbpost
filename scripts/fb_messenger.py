@@ -8,6 +8,7 @@ import sys
 from datetime import datetime, timedelta
 
 from scripts.fb_browser import (
+    _teardown,
     create_browser_context,
     handle_pin_dialog,
     save_storage_state,
@@ -44,6 +45,22 @@ def _save_contact(profile: str, name: str, thread_id: str, e2ee: bool = False):
         json.dump(contacts, f, ensure_ascii=False, indent=2)
 
 
+def _looks_e2ee(thread_id: str) -> bool:
+    """Heuristic: E2E thread IDs are long numerics (>15 digits).
+
+    Centralized so every caller routes the same thread the same way — the
+    magic 15 lives here and nowhere else.
+    """
+    return thread_id.isdigit() and len(thread_id) > 15
+
+
+def _thread_url(thread_id: str) -> str:
+    """Return the Messenger URL for a thread, E2E-aware."""
+    if _looks_e2ee(thread_id):
+        return f"https://www.facebook.com/messages/e2ee/t/{thread_id}/"
+    return f"https://www.facebook.com/messages/t/{thread_id}/"
+
+
 def resolve_thread_id(profile: str, name_or_id: str) -> tuple[str, bool]:
     """Resolve a name or thread ID to (thread_id, is_e2ee).
 
@@ -53,8 +70,7 @@ def resolve_thread_id(profile: str, name_or_id: str) -> tuple[str, bool]:
     """
     # Already a thread ID
     if name_or_id.isdigit():
-        e2ee = len(name_or_id) > 15
-        return name_or_id, e2ee
+        return name_or_id, _looks_e2ee(name_or_id)
 
     # Look up in contacts cache
     contacts = _load_contacts(profile)
@@ -125,6 +141,7 @@ async def verify_contacts(profile: str, count: int = 20, headless: bool = True):
         return
 
     p, browser, context = await create_browser_context(profile, headless)
+    page = None
 
     try:
         page = await context.new_page()
@@ -208,8 +225,7 @@ async def verify_contacts(profile: str, count: int = 20, headless: bool = True):
         await save_storage_state(context, profile)
 
     finally:
-        await browser.close()
-        await p.stop()
+        await _teardown(p, browser, context, page)
 
 
 async def send_message(profile: str, thread_id: str, text: str, headless: bool = True):
@@ -220,20 +236,18 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
     try:
         is_daemon = browser and getattr(browser, '_fbpost_daemon', False)
 
-        if thread_id.isdigit() and len(thread_id) > 15:
-            url = f"https://www.facebook.com/messages/e2ee/t/{thread_id}/"
-        else:
-            url = f"https://www.facebook.com/messages/t/{thread_id}/"
+        url = _thread_url(thread_id)
 
-        # For daemon: try to find an existing page already on this thread
+        # For daemon: reuse a page already on this thread; otherwise open a
+        # fresh one — navigating an arbitrary existing page (e.g. the
+        # pre-warmed Messenger page) would yank it out from under any other
+        # operation using it.
         page = None
         if is_daemon:
             for pg in context.pages:
                 if thread_id in pg.url:
                     page = pg
                     break
-            if not page and context.pages:
-                page = context.pages[0]
 
         if not page:
             page = await context.new_page()
@@ -253,13 +267,10 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
             # will reload the page, which usually resolves encryption loading.
             print(f"Navigating to {url}...")
             await page.goto(url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(4000)
-            # Handle PIN or other blocking dialogs
-            for _ in range(3):
-                if await _dismiss_dialogs(page, profile):
-                    await page.wait_for_timeout(2000)
-                else:
-                    break
+            # No fixed settle wait — the input-box polling loop below already
+            # retries with its own timeouts and dismisses blocking dialogs.
+            if await _dismiss_dialogs(page, profile):
+                await page.wait_for_timeout(1000)
 
         if not await verify_login(page):
             print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
@@ -327,7 +338,10 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
         if text not in input_text:
             print("  fill() failed, falling back to type()...")
             await input_box.click(force=True)
-            await page.keyboard.press("Meta+a")
+            # ControlOrMeta = Cmd on macOS, Ctrl elsewhere — a literal Meta+a
+            # does nothing on Windows/Linux, leaving fill()'s residue to be
+            # prepended to the typed text.
+            await page.keyboard.press("ControlOrMeta+a")
             await page.keyboard.press("Backspace")
             await page.wait_for_timeout(200)
             await input_box.type(text, delay=30)
@@ -339,7 +353,7 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
                 input_text = ""
 
         if text not in input_text:
-            print(f"FAILED: text not in input box. Aborting send.", file=sys.stderr)
+            print("FAILED: text not in input box. Aborting send.", file=sys.stderr)
             sys.exit(1)
 
         # Text confirmed in input — send it
@@ -349,13 +363,37 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
         # POST-SEND: pressing Enter doesn't guarantee delivery (e.g. E2E not
         # ready yet, box not focused). Confirm the input box actually cleared
         # before reporting success — otherwise the text is still sitting there.
+        # If the locator detached (page re-rendered on send), re-resolve it —
+        # treating a failed read as "cleared" would report success blindly.
+        remaining = None
         try:
             remaining = await input_box.inner_text()
         except Exception:
-            remaining = ""
+            try:
+                fresh = page.locator('[contenteditable="true"][role="textbox"]').first
+                remaining = await fresh.inner_text()
+            except Exception:
+                remaining = None
+
+        if remaining is None:
+            # Could not re-read the input box; fall back to a positive check —
+            # did the message text appear in the conversation?
+            try:
+                await page.locator('div[role="main"]').get_by_text(
+                    text[:30], exact=False
+                ).last.wait_for(state="visible", timeout=5000)
+                remaining = ""
+            except Exception:
+                print(
+                    "WARNING: could not verify the send (input box detached and the "
+                    "message was not seen in the thread). Check Messenger manually "
+                    "before retrying — the message MAY have gone out.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
         if text in remaining:
-            print(f"FAILED: input box still contains the text after Enter — message was NOT sent.", file=sys.stderr)
+            print("FAILED: input box still contains the text after Enter — message was NOT sent.", file=sys.stderr)
             sys.exit(1)
 
         print(f"Message sent: \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
@@ -441,6 +479,7 @@ async def _extract_conversations(page, count: int) -> list[dict]:
 async def list_inbox(profile: str, count: int = 20, headless: bool = True):
     """List Messenger inbox conversations."""
     p, browser, context = await create_browser_context(profile, headless)
+    page = None
 
     try:
         page = await context.new_page()
@@ -450,14 +489,19 @@ async def list_inbox(profile: str, count: int = 20, headless: bool = True):
             "https://www.facebook.com/messages/",
             wait_until="domcontentloaded",
         )
-        await page.wait_for_timeout(3000)
 
         if not await verify_login(page):
             print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
             sys.exit(1)
 
         print("Loading conversations...")
-        await page.wait_for_timeout(2000)
+        # Wait for sidebar rows to render instead of a blind 5s of sleeps.
+        try:
+            await page.locator('div[role="navigation"] div[role="row"]').first.wait_for(
+                state="visible", timeout=10000
+            )
+        except Exception:
+            pass  # empty inbox is valid; extraction below handles it
 
         conversations = await _extract_conversations(page, count)
 
@@ -476,8 +520,7 @@ async def list_inbox(profile: str, count: int = 20, headless: bool = True):
         await save_storage_state(context, profile)
 
     finally:
-        await browser.close()
-        await p.stop()
+        await _teardown(p, browser, context, page)
 
 
 async def _scroll_sidebar(page, target_count: int, max_scrolls: int = 80) -> list[dict]:
@@ -561,6 +604,7 @@ async def discover_e2ee_contacts(
     contacts cache for quick access via name.
     """
     p, browser, context = await create_browser_context(profile, headless)
+    page = None
 
     try:
         page = await context.new_page()
@@ -570,15 +614,19 @@ async def discover_e2ee_contacts(
             "https://www.facebook.com/messages/",
             wait_until="domcontentloaded",
         )
-        await page.wait_for_timeout(3000)
 
         if not await verify_login(page):
             print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
             sys.exit(1)
 
-        # Handle any initial dialogs
+        # Handle any initial dialogs, then wait for sidebar rows to render.
         await _dismiss_dialogs(page, profile)
-        await page.wait_for_timeout(2000)
+        try:
+            await page.locator('div[role="navigation"] div[role="row"]').first.wait_for(
+                state="visible", timeout=10000
+            )
+        except Exception:
+            pass
 
         print(f"Scanning sidebar for E2E contacts (target: {count})...")
 
@@ -611,8 +659,7 @@ async def discover_e2ee_contacts(
         await save_storage_state(context, profile)
 
     finally:
-        await browser.close()
-        await p.stop()
+        await _teardown(p, browser, context, page)
 
 
 async def _dismiss_dialogs(page, profile: str = "default"):
@@ -645,6 +692,7 @@ async def search_and_read(
 ):
     """Search for a user in Messenger, open their thread, and read messages."""
     p, browser, context = await create_browser_context(profile, headless)
+    page = None
 
     try:
         page = await context.new_page()
@@ -654,7 +702,6 @@ async def search_and_read(
             "https://www.facebook.com/messages/",
             wait_until="domcontentloaded",
         )
-        await page.wait_for_timeout(4000)
 
         if not await verify_login(page):
             print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
@@ -662,16 +709,16 @@ async def search_and_read(
 
         # Dismiss any blocking dialogs
         await _dismiss_dialogs(page, profile)
-        await page.wait_for_timeout(1000)
 
-        # Find the Messenger search box (supports both EN and zh-TW labels)
+        # Find the Messenger search box (supports both EN and zh-TW labels).
+        # Its own wait absorbs render latency — no blind settle sleep needed.
         print(f"Searching for \"{query}\"...")
         search_box = page.locator(
             'input[aria-label*="Messenger"], input[aria-label*="messenger"]'
         ).first
 
         try:
-            await search_box.wait_for(state="visible", timeout=5000)
+            await search_box.wait_for(state="visible", timeout=10000)
         except Exception:
             # Maybe still behind a dialog — try again
             await _dismiss_dialogs(page, profile)
@@ -681,7 +728,11 @@ async def search_and_read(
         await search_box.click()
         await page.wait_for_timeout(500)
         await search_box.fill(query)
-        await page.wait_for_timeout(3000)
+        # Wait for results to render instead of a blind sleep.
+        try:
+            await page.get_by_role("option").first.wait_for(state="visible", timeout=6000)
+        except Exception:
+            pass  # fall through — the link-based branch below may still match
 
         # Click the matching search result
         # Search results appear as listbox options or links
@@ -694,21 +745,24 @@ async def search_and_read(
         listbox_count = await listbox_items.count()
 
         clicked = False
+        matched_name = ""
         seen_candidates = []
+        # Find the result whose NAME matches the query — never guess. Matching
+        # against the full result text (name + message preview + timestamp)
+        # can hit a preview snippet mentioning the query on the WRONG person's
+        # row; that is the same wrong-contact failure the earlier
+        # blind-click-first-result bug caused.
         if listbox_count > 0:
-            # Find the result matching our query — never guess: a search
-            # result that doesn't literally contain the query text is not
-            # confirmed to be the right person (this previously caused a
-            # message to be sent to the wrong contact when the fallback
-            # blindly clicked the first result).
             for i in range(min(listbox_count, 10)):
                 item = listbox_items.nth(i)
                 try:
                     text = await item.inner_text()
-                    seen_candidates.append(text.split("\n")[0].strip())
-                    if query in text:
+                    name = text.split("\n")[0].strip()
+                    seen_candidates.append(name)
+                    if query in name:
                         await item.click()
                         clicked = True
+                        matched_name = name
                         break
                 except Exception:
                     continue
@@ -717,16 +771,18 @@ async def search_and_read(
                 link = result_links.nth(i)
                 try:
                     text = await link.inner_text()
-                    seen_candidates.append(text.split("\n")[0].strip())
-                    if query in text:
+                    name = text.split("\n")[0].strip()
+                    seen_candidates.append(name)
+                    if query in name:
                         await link.click()
                         clicked = True
+                        matched_name = name
                         break
                 except Exception:
                     continue
 
         if not clicked:
-            print(f"No result whose text literally contains \"{query}\" — refusing to guess.", file=sys.stderr)
+            print(f"No result whose NAME literally contains \"{query}\" — refusing to guess.", file=sys.stderr)
             if seen_candidates:
                 print(f"Candidates seen: {seen_candidates}", file=sys.stderr)
                 print("Re-run search with one of these exact names, or use a thread ID directly.", file=sys.stderr)
@@ -749,10 +805,13 @@ async def search_and_read(
         elif "/messages/t/" in current_url:
             thread_id = current_url.split("/messages/t/")[-1].rstrip("/").split("?")[0]
 
-        # Cache the discovered contact
+        # Cache the discovered contact under Messenger's REAL displayed name
+        # (not the query) — send/search match by display name, so caching a
+        # partial query as the name would poison later lookups.
         if thread_id:
-            _save_contact(profile, query, thread_id, e2ee)
-            print(f"Cached contact: {query} → {thread_id} (E2E: {e2ee})")
+            cache_name = matched_name or query
+            _save_contact(profile, cache_name, thread_id, e2ee)
+            print(f"Cached contact: {cache_name} → {thread_id} (E2E: {e2ee})")
 
         print(f"Opened thread: {thread_id or '(unknown)'}")
         print("Reading messages...")
@@ -777,8 +836,7 @@ async def search_and_read(
         await save_storage_state(context, profile)
 
     finally:
-        await browser.close()
-        await p.stop()
+        await _teardown(p, browser, context, page)
 
 
 async def _extract_messages(page, count: int) -> list[str]:
@@ -813,18 +871,14 @@ async def read_thread(
 ):
     """Read messages from a specific Messenger thread."""
     p, browser, context = await create_browser_context(profile, headless)
+    page = None
 
     try:
         page = await context.new_page()
 
-        # Use E2E URL path for numeric thread IDs (encrypted threads)
-        if thread_id.isdigit() and len(thread_id) > 15:
-            url = f"https://www.facebook.com/messages/e2ee/t/{thread_id}/"
-        else:
-            url = f"https://www.facebook.com/messages/t/{thread_id}/"
+        url = _thread_url(thread_id)
         print(f"Navigating to {url}...")
         await page.goto(url, wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
 
         if not await verify_login(page):
             print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
@@ -832,10 +886,15 @@ async def read_thread(
 
         # Handle PIN dialog for E2E threads
         await _dismiss_dialogs(page, profile)
-        await page.wait_for_timeout(1000)
 
         print("Loading messages...")
-        await page.wait_for_timeout(2000)
+        # Wait for message rows to render instead of ~6s of blind sleeps.
+        try:
+            await page.locator('div[role="main"] div[role="row"]').first.wait_for(
+                state="visible", timeout=10000
+            )
+        except Exception:
+            pass  # empty thread is valid; extraction handles it
 
         messages = await _extract_messages(page, count)
 
@@ -855,8 +914,7 @@ async def read_thread(
         await save_storage_state(context, profile)
 
     finally:
-        await browser.close()
-        await p.stop()
+        await _teardown(p, browser, context, page)
 
 
 def _parse_timestamp(text: str, reference_date: datetime | None = None) -> str | None:
@@ -1138,15 +1196,14 @@ async def scroll_and_extract_thread(
     of messages, parses them into structured format, and saves to JSON.
     """
     p, browser, context = await create_browser_context(profile, headless)
+    page = None
 
     try:
         page = await context.new_page()
 
-        # Use E2E URL path for encrypted threads
-        if thread_id.isdigit():
-            url = f"https://www.facebook.com/messages/e2ee/t/{thread_id}/"
-        else:
-            url = f"https://www.facebook.com/messages/t/{thread_id}/"
+        # Same E2E-aware routing as send/read — a short numeric (non-E2E)
+        # thread used to be sent to the e2ee URL here and scrape nothing.
+        url = _thread_url(thread_id)
 
         print(f"Navigating to {url}...")
         await page.goto(url, wait_until="domcontentloaded")
@@ -1174,9 +1231,13 @@ async def scroll_and_extract_thread(
             json.dump(raw_texts, f, ensure_ascii=False, indent=2)
         print(f"  Raw texts saved to {debug_file}")
 
-        # Parse into structured messages
+        # Parse into structured messages. self_name from config.json labels
+        # the account's own messages (README documents it; it was previously
+        # read nowhere).
         print("Parsing messages...")
-        messages = _parse_raw_messages(raw_texts)
+        from scripts.fb_browser import load_profile_config
+        my_name = load_profile_config(profile).get("self_name") or "你"
+        messages = _parse_raw_messages(raw_texts, my_name=my_name)
         print(f"  Parsed {len(messages)} messages.")
 
         # Filter by date range
@@ -1224,5 +1285,4 @@ async def scroll_and_extract_thread(
         return output_file
 
     finally:
-        await browser.close()
-        await p.stop()
+        await _teardown(p, browser, context, page)

@@ -4,10 +4,13 @@ import asyncio
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
+
+from scripts.fb_config import FB_USER_AGENT
 
 stealth = Stealth(
     navigator_platform_override="MacIntel",
@@ -121,6 +124,10 @@ async def start_daemon(profile: str):
         print(f"Daemon already running on port {CDP_PORT}.")
         await p.stop()
         return
+    if os.path.exists(_DAEMON_PID_FILE):
+        # Leftover from a hard kill/crash — the port probe above is the real
+        # liveness signal, so reconcile the stale file.
+        os.remove(_DAEMON_PID_FILE)
 
     user_data = _user_data_dir(profile)
     os.makedirs(user_data, exist_ok=True)
@@ -137,7 +144,7 @@ async def start_daemon(profile: str):
         ],
     )
 
-    ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+    ua = FB_USER_AGENT
 
     if os.path.exists(storage_path):
         context = await browser.new_context(
@@ -174,17 +181,29 @@ async def start_daemon(profile: str):
     # Keep alive until interrupted
     stop = asyncio.Event()
     loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set)
+    except NotImplementedError:
+        pass  # Windows event loops don't support signal handlers; Ctrl+C
+        # surfaces as KeyboardInterrupt instead.
 
-    await stop.wait()
-
-    print("\nStopping daemon...")
-    if os.path.exists(_DAEMON_PID_FILE):
-        os.remove(_DAEMON_PID_FILE)
-    await save_storage_state(context, profile)
-    await browser.close()
-    await p.stop()
+    try:
+        await stop.wait()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        # Clean up even on an unexpected exit so no orphaned Chromium keeps
+        # the CDP port and no stale PID file is left behind.
+        print("\nStopping daemon...")
+        if os.path.exists(_DAEMON_PID_FILE):
+            os.remove(_DAEMON_PID_FILE)
+        try:
+            await save_storage_state(context, profile)
+        except Exception:
+            pass
+        await browser.close()
+        await p.stop()
     print("Daemon stopped.")
 
 
@@ -203,7 +222,7 @@ async def create_browser_context(profile: str, headless: bool = True, persistent
         "--disable-blink-features=AutomationControlled",
     ]
 
-    ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+    ua = FB_USER_AGENT
 
     # Try to connect to daemon first (fastest path — no cold start)
     browser, context = await connect_to_daemon(p)
@@ -340,10 +359,27 @@ async def handle_pin_dialog(page, profile: str) -> bool:
 
 
 async def verify_login(page) -> bool:
-    """Check if we're logged in by verifying URL doesn't redirect to login."""
+    """Check if we're logged in.
+
+    URL checks alone are not enough: the logged-out homepage lives at the
+    bare facebook.com URL (no "/login" substring) — the same blind spot that
+    once broke capture_login. So also require the c_user auth cookie and the
+    absence of a visible password field.
+    """
     url = page.url
     if "/login" in url or "checkpoint" in url:
         return False
+    try:
+        cookies = await page.context.cookies("https://www.facebook.com")
+        if not any(c["name"] == "c_user" for c in cookies):
+            return False
+    except Exception:
+        return False
+    try:
+        if await page.locator('input[name="pass"]').first.is_visible():
+            return False
+    except Exception:
+        pass
     return True
 
 
@@ -365,7 +401,7 @@ async def capture_login(profile: str):
 
     context = await browser.new_context(
         viewport={"width": 1920, "height": 1080},
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+        user_agent=FB_USER_AGENT,
     )
 
     await stealth.apply_stealth_async(context)
@@ -431,6 +467,55 @@ async def capture_login(profile: str):
     print("Done! You can now use other commands.")
 
 
+async def _teardown(p, browser, context, page=None):
+    """Close what this command owns — never kill a shared daemon browser.
+
+    create_browser_context may hand back the long-lived daemon browser
+    (marked _fbpost_daemon); closing it would silently tear the daemon down
+    and every later command would pay a cold start again. In that case only
+    close the page we opened on it.
+    """
+    try:
+        if browser is not None and getattr(browser, "_fbpost_daemon", False):
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+        elif browser is not None:
+            await browser.close()
+        elif context is not None:
+            await context.close()
+    finally:
+        await p.stop()
+
+
+async def _wait_composer_closed(page, dialog, seconds=15) -> bool:
+    """Poll for the composer dialog to disappear; True means it closed.
+
+    Uses the dialog's element handle captured up front so a *different*
+    dialog appearing after submit can't be mistaken for the composer still
+    being open. The close can lag several seconds (slower on a public
+    audience / slow network) — a fixed wait plus a single check used to
+    false-fail on EVERYONE posts even though the post WAS accepted.
+    """
+    try:
+        handle = await dialog.element_handle(timeout=2000)
+    except Exception:
+        handle = None
+    for _ in range(seconds * 2):
+        await page.wait_for_timeout(500)
+        try:
+            if handle is not None:
+                if not await handle.is_visible():
+                    return True
+            elif not (bool(await dialog.count()) and await dialog.is_visible()):
+                return True
+        except Exception:
+            return True
+    return False
+
+
 _PRIVACY_LABELS = {
     "EVERYONE": "所有人",
     "FRIENDS": "朋友",
@@ -455,20 +540,23 @@ async def post_via_composer(
     """
     p, browser, context = await create_browser_context(profile, headless, persistent=False)
 
+    page = None
+    step = "opening facebook.com"
     try:
         page = await context.new_page()
         await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(4000)
 
         if not await verify_login(page):
             print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
             sys.exit(1)
 
-        # Open the composer (label varies EN/zh-TW)
+        # Open the composer (label varies EN/zh-TW). No fixed settle wait —
+        # the click timeout itself absorbs render latency.
+        step = "opening the composer"
         opened = False
-        for label in ["What's on your mind", "在想些什麼"]:
+        for label in ["在想些什麼", "What's on your mind"]:
             try:
-                await page.get_by_text(label, exact=False).first.click(timeout=5000)
+                await page.get_by_text(label, exact=False).first.click(timeout=8000)
                 opened = True
                 break
             except Exception:
@@ -476,13 +564,14 @@ async def post_via_composer(
         if not opened:
             print("Error: Could not open the composer (post box not found).", file=sys.stderr)
             sys.exit(1)
-        await page.wait_for_timeout(3000)
 
         dialog = page.get_by_role("dialog").first
+        textbox = dialog.get_by_role("textbox").first
+        await textbox.wait_for(state="visible", timeout=10000)
 
         # PRE-SEND style verification: type text and confirm it landed before
         # doing anything else (same discipline as send_message in fb_messenger.py).
-        textbox = dialog.get_by_role("textbox").first
+        step = "typing the post text"
         await textbox.click(timeout=5000)
         await textbox.type(text, delay=20, timeout=15000)
         await page.wait_for_timeout(500)
@@ -498,24 +587,43 @@ async def post_via_composer(
             if not os.path.isfile(image_path):
                 print(f"Error: image file not found: {image_path}", file=sys.stderr)
                 sys.exit(1)
+            step = "attaching the photo"
             file_input = dialog.locator('input[type="file"]').first
             await file_input.set_input_files(os.path.abspath(image_path), timeout=15000)
-            try:
-                await dialog.get_by_text("已上傳的影音內容", exact=False).first.wait_for(
-                    state="visible", timeout=20000
-                )
+            # Accept either the media-gallery caption or a rendered preview
+            # image — a single still image can render without the
+            # "已上傳的影音內容" caption, which used to false-FAIL the attach.
+            attached = False
+            for _ in range(40):  # up to ~20s
+                try:
+                    if await dialog.get_by_text("已上傳的影音內容", exact=False).first.is_visible():
+                        attached = True
+                    elif await dialog.locator('img[src^="blob:"]').first.is_visible():
+                        attached = True
+                except Exception:
+                    pass
+                if attached:
+                    break
+                await page.wait_for_timeout(500)
+            if attached:
                 print("Photo attached.")
-            except Exception:
-                print("FAILED: photo did not appear to attach (upload indicator never showed).", file=sys.stderr)
+            else:
+                print("FAILED: photo did not appear to attach (no upload indicator or preview image).", file=sys.stderr)
                 sys.exit(1)
 
         # Audience/privacy — always set explicitly rather than trusting
         # whatever FB last remembered as the default.
+        step = "setting the audience"
         target_label = _PRIVACY_LABELS.get(privacy, "所有人")
         audience_row = dialog.get_by_text("貼文分享對象", exact=False).first
         await audience_row.click(timeout=8000)
-        await page.wait_for_timeout(1500)
+        # Wait for the audience modal to open (dialog count grows) instead of
+        # a blind sleep.
         privacy_dialogs = page.get_by_role("dialog")
+        for _ in range(10):
+            if await privacy_dialogs.count() > 1:
+                break
+            await page.wait_for_timeout(300)
         pd_count = await privacy_dialogs.count()
         privacy_modal = privacy_dialogs.nth(pd_count - 1)
         await privacy_modal.get_by_text(target_label, exact=True).first.click(timeout=5000)
@@ -532,37 +640,62 @@ async def post_via_composer(
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            if dt <= datetime.now():
-                print("Error: --schedule time must be in the future.", file=sys.stderr)
+            # Times are typed verbatim into the composer, so FB interprets
+            # them in the ACCOUNT's timezone; this validation uses the local
+            # clock and assumes the two match. FB also enforces a ~10-minute
+            # minimum lead time — catch that here with a clear message
+            # instead of a generic composer failure later.
+            if dt <= datetime.now() + timedelta(minutes=10):
+                print(
+                    "Error: --schedule time must be at least 10 minutes in the future "
+                    "(Facebook's minimum; time is interpreted in your FB account's timezone).",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
             date_str = f"{dt.year}年{dt.month}月{dt.day}日"
             time_str = dt.strftime("%H:%M")
 
+            step = "opening the schedule options"
             await dialog.get_by_text("排程", exact=True).first.click(timeout=8000)
-            await page.wait_for_timeout(2000)
 
             heading = page.get_by_text("排程選項", exact=True).first
             await heading.wait_for(state="visible", timeout=8000)
             schedule_container = heading.locator(
                 "xpath=ancestor::*[.//text()[contains(.,'日期')] and .//text()[contains(.,'時間')]][1]"
             )
+            step = "filling the schedule date/time"
             schedule_inputs = schedule_container.locator("input")
             await schedule_inputs.nth(0).fill(date_str, timeout=5000)
             await page.wait_for_timeout(500)
             await schedule_inputs.nth(1).fill(time_str, timeout=5000)
             await page.wait_for_timeout(500)
 
-            confirm_btn = schedule_container.locator('div[role="button"][aria-label="排定稍後通話"]').first
-            try:
-                await confirm_btn.wait_for(state="visible", timeout=5000)
-            except Exception:
-                # Upstream label may change; fall back to any enabled button
-                # in the schedule container that isn't the close/date-picker button.
-                confirm_btn = schedule_container.locator(
-                    'div[role="button"]:not([aria-label*="關閉"]):not([aria-label*="日期"])'
-                ).last
+            # Popup confirm button. Try plausible confirm labels first, then
+            # the historical "排定稍後通話" aria-label, then fall back to the
+            # last non-close/non-date button (the path that has worked in
+            # live testing). This button only stores the chosen time — the
+            # real submit is the relabeled main composer button below.
+            step = "confirming the schedule popup"
+            confirm_btn = None
+            for name in ["儲存", "完成", "確定", "Save", "Done"]:
+                cand = schedule_container.get_by_role("button", name=name).first
+                try:
+                    await cand.wait_for(state="visible", timeout=1000)
+                    confirm_btn = cand
+                    break
+                except Exception:
+                    continue
+            if confirm_btn is None:
+                cand = schedule_container.locator('div[role="button"][aria-label="排定稍後通話"]').first
+                try:
+                    await cand.wait_for(state="visible", timeout=2000)
+                    confirm_btn = cand
+                except Exception:
+                    confirm_btn = schedule_container.locator(
+                        'div[role="button"]:not([aria-label*="關閉"]):not([aria-label*="日期"])'
+                    ).last
             await confirm_btn.click(timeout=8000)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(1000)
 
             # This confirm button only closes the date/time popup and stores
             # the chosen time on the composer — it does NOT submit anything.
@@ -572,26 +705,14 @@ async def post_via_composer(
             # A prior version of this function stopped after the popup
             # confirm and reported "scheduled" even though nothing was ever
             # sent — the draft just sat open until the browser closed.
+            step = "submitting the scheduled post"
             finalize_btn = dialog.get_by_text("設定貼文發佈時間", exact=True).first
             await finalize_btn.wait_for(state="visible", timeout=5000)
             await finalize_btn.click(timeout=8000)
 
-            # POST-SEND verification: the composer closes only when FB accepts
-            # the scheduled post. That close can lag several seconds (slower on
-            # a public audience / slow network), so POLL for it to disappear
-            # rather than assuming a fixed wait is enough — a fixed 3s wait then
-            # a single check made this racily false-fail on EVERYONE posts even
-            # though the post WAS scheduled.
-            still_open = True
-            for _ in range(30):  # up to ~15s
-                await page.wait_for_timeout(500)
-                try:
-                    still_open = bool(await dialog.count()) and await dialog.is_visible()
-                except Exception:
-                    still_open = False
-                if not still_open:
-                    break
-            if still_open:
+            # POST-SEND verification: the composer closes only when FB
+            # accepts the scheduled post.
+            if not await _wait_composer_closed(page, dialog):
                 print(
                     "FAILED: composer still open after clicking 設定貼文發佈時間 — "
                     "post was NOT scheduled.", file=sys.stderr,
@@ -599,21 +720,11 @@ async def post_via_composer(
                 sys.exit(1)
             print(f"Post scheduled for {date_str} {time_str}.")
         else:
+            step = "publishing the post"
             publish_btn = dialog.get_by_text("發佈", exact=True).first
             await publish_btn.click(timeout=8000)
 
-            # Same racy-close concern as the scheduled path — poll for the
-            # composer to disappear instead of a single fixed-delay check.
-            still_open = True
-            for _ in range(30):  # up to ~15s
-                await page.wait_for_timeout(500)
-                try:
-                    still_open = bool(await dialog.count()) and await dialog.is_visible()
-                except Exception:
-                    still_open = False
-                if not still_open:
-                    break
-            if still_open:
+            if not await _wait_composer_closed(page, dialog):
                 print(
                     "FAILED: composer still open after clicking 發佈 — post was NOT published.",
                     file=sys.stderr,
@@ -623,9 +734,15 @@ async def post_via_composer(
 
         await save_storage_state(context, profile)
 
+    except PlaywrightTimeoutError:
+        print(
+            f"FAILED while {step}: Facebook's UI did not respond as expected "
+            "(a selector timed out). The layout may have changed or the page is slow.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     finally:
-        await browser.close()
-        await p.stop()
+        await _teardown(p, browser, context, page)
 
 
 # ---------------------------------------------------------------------------
@@ -647,18 +764,25 @@ _DELETE_MENUITEM = "刪除貼文"
 async def _open_scheduled_tab(page):
     """Navigate to the Content Library and switch to the Scheduled tab."""
     await page.goto(CONTENT_LIBRARY_URL, wait_until="domcontentloaded", timeout=30000)
-    await page.wait_for_timeout(7000)
     if not await verify_login(page):
         print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
         sys.exit(1)
     # The tab is a role=tab; get_by_text often resolves to a hidden measuring
     # span reported as "not visible", so target the accessible tab role.
     tab = page.get_by_role("tab", name=_SCHEDULED_TAB)
+    try:
+        await tab.first.wait_for(state="visible", timeout=20000)
+    except Exception:
+        pass  # fall through to the click loop's own error handling
     for i in range(await tab.count()):
         try:
             await tab.nth(i).scroll_into_view_if_needed(timeout=3000)
             await tab.nth(i).click(timeout=4000)
-            await page.wait_for_timeout(5000)
+            # Wait for rows to render (an empty list is valid — cap at ~6s).
+            for _ in range(12):
+                if await page.get_by_role("button", name=_ROW_ACTION_LABEL).count():
+                    break
+                await page.wait_for_timeout(500)
             return
         except Exception:
             continue
@@ -678,7 +802,19 @@ async def _scheduled_rows(page):
     tightest ancestor holding a single action button.
     """
     actions = page.get_by_role("button", name=_ROW_ACTION_LABEL)
+    # The table lazy-loads on scroll — keep scrolling the last row into view
+    # until the count stops growing, so indexes cover ALL scheduled posts
+    # (a truncated list would make delete-by-index hit the wrong post).
+    prev = -1
     n = await actions.count()
+    while n and n != prev:
+        prev = n
+        try:
+            await actions.nth(n - 1).scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            break
+        await page.wait_for_timeout(1000)
+        n = await actions.count()
     rows = []
     for i in range(n):
         text, when = "", ""
@@ -703,6 +839,7 @@ async def _scheduled_rows(page):
 async def list_scheduled_posts(profile: str, headless: bool = True):
     """Print all scheduled posts (1-based index, time, preview)."""
     p, browser, context = await create_browser_context(profile, headless, persistent=False)
+    page = None
     try:
         page = await context.new_page()
         await _open_scheduled_tab(page)
@@ -716,13 +853,18 @@ async def list_scheduled_posts(profile: str, headless: bool = True):
             print(f"[{r['index'] + 1}] {r['when']}")
             print(f"    {r['text']}")
     finally:
-        await browser.close()
-        await p.stop()
+        await _teardown(p, browser, context, page)
 
 
-async def delete_scheduled_post(profile: str, index: int, headless: bool = False):
-    """Delete the scheduled post at 1-based `index` (as shown by list)."""
+async def delete_scheduled_post(profile: str, index: int, headless: bool = False, match: str = None):
+    """Delete the scheduled post at 1-based `index` (as shown by list).
+
+    The index is resolved freshly in THIS browser session; if `match` is
+    given, the target row's preview text must contain it or nothing is
+    deleted — protects against the list having changed since you looked.
+    """
     p, browser, context = await create_browser_context(profile, headless, persistent=False)
+    page = None
     try:
         page = await context.new_page()
         await _open_scheduled_tab(page)
@@ -732,6 +874,14 @@ async def delete_scheduled_post(profile: str, index: int, headless: bool = False
             print(f"Error: index {index} out of range (1..{before}).", file=sys.stderr)
             sys.exit(1)
         target = rows[index - 1]
+        if match and match not in target["text"] and match not in target["when"]:
+            print(
+                f"ABORTED: row [{index}] does not match --match {match!r}.\n"
+                f"  Found instead: {target['when']} — {target['text']}\n"
+                "  The list may have changed; re-run post-list-scheduled.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print(f"Deleting [{index}] {target['when']} — {target['text']}")
 
         await actions.nth(index - 1).click(timeout=6000)
@@ -764,5 +914,4 @@ async def delete_scheduled_post(profile: str, index: int, headless: bool = False
             )
             sys.exit(1)
     finally:
-        await browser.close()
-        await p.stop()
+        await _teardown(p, browser, context, page)

@@ -107,7 +107,7 @@ def post_to_facebook(text: str, privacy: str = "SELF") -> None:
 
     story = data.get("data", {}).get("story_create", {}).get("story")
     if story:
-        print(f"\nSuccess! Story created.")
+        print("\nSuccess! Story created.")
         print(f"  Story ID: {story.get('id', 'unknown')}")
         if story.get("url"):
             print(f"  URL: {story['url']}")

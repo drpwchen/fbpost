@@ -130,7 +130,7 @@ def cmd_post(args):
 
     story = data.get("data", {}).get("story_create", {}).get("story")
     if story:
-        print(f"\nSuccess! Story created.")
+        print("\nSuccess! Story created.")
         print(f"  Story ID: {story.get('id', 'unknown')}")
         if story.get("url"):
             print(f"  URL: {story['url']}")
@@ -184,13 +184,15 @@ def _fetch_comments(session, tokens, actor_id, page_id, args, cursor):
 def cmd_list_scheduled(args):
     """List scheduled posts from the Content Library (Scheduled tab)."""
     from scripts.fb_browser import list_scheduled_posts
-    asyncio.run(list_scheduled_posts(args.profile, headless=args.headless))
+    asyncio.run(list_scheduled_posts(args.profile, headless=not args.no_headless))
 
 
 def cmd_delete_scheduled(args):
     """Delete a scheduled post by its 1-based list index."""
     from scripts.fb_browser import delete_scheduled_post
-    asyncio.run(delete_scheduled_post(args.profile, args.index, headless=args.headless))
+    asyncio.run(delete_scheduled_post(
+        args.profile, args.index, headless=args.headless, match=args.match,
+    ))
 
 
 def cmd_comments(args):
@@ -353,7 +355,7 @@ def cmd_comments(args):
                 for extra in full_texts[1:]:
                     print(f"   ↳ Shared: {extra[:80]}{'…' if len(extra) > 80 else ''}")
             else:
-                print(f"📝 Post: (no text)")
+                print("📝 Post: (no text)")
             print(f"   ({c['post_url'][:60]})")
             print(f"   {'#':<3} {'Author':<20} {'Comment':<50} {'Time'}")
             print(f"   {'─' * 90}")
@@ -471,7 +473,7 @@ def cmd_reply(args):
     comment_create = data.get("data", {}).get("comment_create", {})
     comment = comment_create.get("comment")
     if comment:
-        print(f"\nReply posted successfully!")
+        print("\nReply posted successfully!")
         print(f"  Comment ID: {comment.get('id', 'unknown')}")
     else:
         print("\nRequest sent. Response:")
@@ -573,29 +575,36 @@ def main():
         "--image", help="Path to an image to attach (routes through the browser composer, not the GraphQL fast path)",
     )
     post_parser.add_argument(
-        "--schedule", help="Schedule for later, 'YYYY-MM-DD HH:MM' 24hr (routes through the browser composer)",
+        "--schedule",
+        help="Schedule for later, 'YYYY-MM-DD HH:MM' 24hr, at least 10 minutes out; "
+        "interpreted in your FB account's timezone (assumed to match this machine). "
+        "Routes through the browser composer.",
     )
     post_parser.add_argument(
         "--headless", action="store_true",
         help="Run headless when --image/--schedule is used (default: headed)",
     )
 
-    # post-list-scheduled
+    # post-list-scheduled (read-only -> headless by default, like inbox/read)
     pls_parser = subparsers.add_parser(
         "post-list-scheduled",
         help="List scheduled posts (Content Library > Scheduled tab)",
     )
     pls_parser.add_argument(
-        "--headless", action="store_true",
-        help="Run headless (default: headed)",
+        "--no-headless", action="store_true",
+        help="Run in headed mode (default: headless)",
     )
 
-    # post-delete-scheduled
+    # post-delete-scheduled (destructive -> headed by default, like send/post)
     pds_parser = subparsers.add_parser(
         "post-delete-scheduled",
         help="Delete a scheduled post by its 1-based index (from post-list-scheduled)",
     )
     pds_parser.add_argument("index", type=int, help="1-based index shown by post-list-scheduled")
+    pds_parser.add_argument(
+        "--match",
+        help="Safety check: abort unless the target row's preview text contains this string",
+    )
     pds_parser.add_argument(
         "--headless", action="store_true",
         help="Run headless (default: headed)",
