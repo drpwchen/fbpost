@@ -575,12 +575,22 @@ async def post_via_composer(
             finalize_btn = dialog.get_by_text("設定貼文發佈時間", exact=True).first
             await finalize_btn.wait_for(state="visible", timeout=5000)
             await finalize_btn.click(timeout=8000)
-            await page.wait_for_timeout(3000)
 
-            # POST-SEND verification: the composer dialog should be gone once
-            # the scheduled post is actually accepted. If it's still open,
-            # nothing was submitted — report failure instead of guessing.
-            still_open = await dialog.count() and await dialog.is_visible()
+            # POST-SEND verification: the composer closes only when FB accepts
+            # the scheduled post. That close can lag several seconds (slower on
+            # a public audience / slow network), so POLL for it to disappear
+            # rather than assuming a fixed wait is enough — a fixed 3s wait then
+            # a single check made this racily false-fail on EVERYONE posts even
+            # though the post WAS scheduled.
+            still_open = True
+            for _ in range(30):  # up to ~15s
+                await page.wait_for_timeout(500)
+                try:
+                    still_open = bool(await dialog.count()) and await dialog.is_visible()
+                except Exception:
+                    still_open = False
+                if not still_open:
+                    break
             if still_open:
                 print(
                     "FAILED: composer still open after clicking 設定貼文發佈時間 — "
@@ -591,9 +601,18 @@ async def post_via_composer(
         else:
             publish_btn = dialog.get_by_text("發佈", exact=True).first
             await publish_btn.click(timeout=8000)
-            await page.wait_for_timeout(3000)
 
-            still_open = await dialog.count() and await dialog.is_visible()
+            # Same racy-close concern as the scheduled path — poll for the
+            # composer to disappear instead of a single fixed-delay check.
+            still_open = True
+            for _ in range(30):  # up to ~15s
+                await page.wait_for_timeout(500)
+                try:
+                    still_open = bool(await dialog.count()) and await dialog.is_visible()
+                except Exception:
+                    still_open = False
+                if not still_open:
+                    break
             if still_open:
                 print(
                     "FAILED: composer still open after clicking 發佈 — post was NOT published.",
