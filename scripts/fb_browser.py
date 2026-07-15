@@ -626,3 +626,143 @@ async def post_via_composer(
     finally:
         await browser.close()
         await p.stop()
+
+
+# ---------------------------------------------------------------------------
+# Scheduled-post management (list / delete)
+#
+# Personal profiles have no Facebook Page, so Meta Business Suite is
+# unavailable. Scheduled posts live in the Professional Dashboard's Content
+# Library under the "已排定發佈" (Scheduled) tab. We drive that table.
+# ---------------------------------------------------------------------------
+
+CONTENT_LIBRARY_URL = (
+    "https://www.facebook.com/professional_dashboard/content/content_library/"
+)
+_SCHEDULED_TAB = "已排定發佈"
+_ROW_ACTION_LABEL = "可對此貼文採取的動作"
+_DELETE_MENUITEM = "刪除貼文"
+
+
+async def _open_scheduled_tab(page):
+    """Navigate to the Content Library and switch to the Scheduled tab."""
+    await page.goto(CONTENT_LIBRARY_URL, wait_until="domcontentloaded", timeout=30000)
+    await page.wait_for_timeout(7000)
+    if not await verify_login(page):
+        print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
+        sys.exit(1)
+    # The tab is a role=tab; get_by_text often resolves to a hidden measuring
+    # span reported as "not visible", so target the accessible tab role.
+    tab = page.get_by_role("tab", name=_SCHEDULED_TAB)
+    for i in range(await tab.count()):
+        try:
+            await tab.nth(i).scroll_into_view_if_needed(timeout=3000)
+            await tab.nth(i).click(timeout=4000)
+            await page.wait_for_timeout(5000)
+            return
+        except Exception:
+            continue
+    print(
+        f"Error: could not open the '{_SCHEDULED_TAB}' (Scheduled) tab.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+async def _scheduled_rows(page):
+    """Return (action_button_locator, [{index, text, when}, ...]) in list order.
+
+    Each scheduled row owns exactly one "actions" button. To read a row's OWN
+    text (not the whole table's), climb to the nearest ancestor that contains
+    this button but NOT the neighbouring rows' action buttons — i.e. the
+    tightest ancestor holding a single action button.
+    """
+    actions = page.get_by_role("button", name=_ROW_ACTION_LABEL)
+    n = await actions.count()
+    rows = []
+    for i in range(n):
+        text, when = "", ""
+        try:
+            # each scheduled entry is a role=row that owns exactly one action
+            # button; the header row has none, so buttons map 1:1 to data rows.
+            row = actions.nth(i).locator("xpath=ancestor::*[@role='row'][1]")
+            raw = (await row.inner_text()).replace("\xa0", " ")
+            lines = [l.strip() for l in raw.splitlines() if l.strip() and l.strip() != "預覽"]
+            # schedule info spans "已排定 •" and a time line like "明天上午11:00"
+            sched_kw = ("已排定", "上午", "下午")
+            when = " ".join(l for l in lines if any(k in l for k in sched_kw))
+            # FB renders the preview text twice; take the first non-schedule line
+            text_lines = [l for l in lines if not any(k in l for k in sched_kw)]
+            text = text_lines[0] if text_lines else ""
+        except Exception:
+            pass
+        rows.append({"index": i, "text": text[:100], "when": when})
+    return actions, rows
+
+
+async def list_scheduled_posts(profile: str, headless: bool = True):
+    """Print all scheduled posts (1-based index, time, preview)."""
+    p, browser, context = await create_browser_context(profile, headless, persistent=False)
+    try:
+        page = await context.new_page()
+        await _open_scheduled_tab(page)
+        _, rows = await _scheduled_rows(page)
+        if not rows:
+            print("No scheduled posts.")
+            return
+        print(f"Scheduled posts ({len(rows)}):")
+        print("-" * 72)
+        for r in rows:
+            print(f"[{r['index'] + 1}] {r['when']}")
+            print(f"    {r['text']}")
+    finally:
+        await browser.close()
+        await p.stop()
+
+
+async def delete_scheduled_post(profile: str, index: int, headless: bool = False):
+    """Delete the scheduled post at 1-based `index` (as shown by list)."""
+    p, browser, context = await create_browser_context(profile, headless, persistent=False)
+    try:
+        page = await context.new_page()
+        await _open_scheduled_tab(page)
+        actions, rows = await _scheduled_rows(page)
+        before = len(rows)
+        if index < 1 or index > before:
+            print(f"Error: index {index} out of range (1..{before}).", file=sys.stderr)
+            sys.exit(1)
+        target = rows[index - 1]
+        print(f"Deleting [{index}] {target['when']} — {target['text']}")
+
+        await actions.nth(index - 1).click(timeout=6000)
+        await page.wait_for_timeout(1500)
+        await page.get_by_role("menuitem", name=_DELETE_MENUITEM).first.click(timeout=6000)
+        await page.wait_for_timeout(1500)
+
+        # Confirmation dialog: click its primary delete/confirm button.
+        dialogs = page.get_by_role("dialog")
+        dc = await dialogs.count()
+        if dc:
+            dlg = dialogs.nth(dc - 1)
+            for name in ["刪除貼文", "刪除", "確認"]:
+                b = dlg.get_by_role("button", name=name)
+                if await b.count():
+                    await b.first.click(timeout=5000)
+                    break
+        await page.wait_for_timeout(4000)
+
+        # POST verification: the row count must drop, or we report failure
+        # rather than falsely claiming success.
+        after = await page.get_by_role("button", name=_ROW_ACTION_LABEL).count()
+        if after < before:
+            print(f"Deleted. Scheduled posts: {before} -> {after}")
+        else:
+            print(
+                f"FAILED: scheduled count did not drop ({before} -> {after}); "
+                "deletion may not have gone through.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    finally:
+        await browser.close()
+        await p.stop()

@@ -75,6 +75,27 @@ uv run fb --profile fanpage post "Hello from page" --privacy EVERYONE
 
 Options: `--privacy SELF|FRIENDS|EVERYONE` (default: `SELF`)
 
+Schedule for later (drives the composer UI, headed by default):
+
+```bash
+uv run fb post "Later post" --privacy EVERYONE --schedule "2026-07-17 11:00"
+```
+
+### Scheduled posts — List / Delete
+
+Scheduled posts live in the Professional Dashboard's Content Library
+(**Content → Scheduled** tab); for a personal profile with no Page, Meta
+Business Suite is unavailable, so these commands drive that tab.
+
+```bash
+uv run fb post-list-scheduled              # list scheduled posts with a 1-based index
+uv run fb post-delete-scheduled 2          # delete the post shown at index 2
+```
+
+`post-delete-scheduled` re-verifies that the scheduled count actually dropped
+before reporting success. Both are headed by default; add `--headless` to hide
+the browser.
+
 ### Comments
 
 ```bash

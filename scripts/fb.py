@@ -181,6 +181,18 @@ def _fetch_comments(session, tokens, actor_id, page_id, args, cursor):
     return (edges, page_info) if edges else None
 
 
+def cmd_list_scheduled(args):
+    """List scheduled posts from the Content Library (Scheduled tab)."""
+    from scripts.fb_browser import list_scheduled_posts
+    asyncio.run(list_scheduled_posts(args.profile, headless=args.headless))
+
+
+def cmd_delete_scheduled(args):
+    """Delete a scheduled post by its 1-based list index."""
+    from scripts.fb_browser import delete_scheduled_post
+    asyncio.run(delete_scheduled_post(args.profile, args.index, headless=args.headless))
+
+
 def cmd_comments(args):
     """List unreplied comments from Professional Dashboard."""
     cookies = load_cookies(args.profile)
@@ -568,6 +580,27 @@ def main():
         help="Run headless when --image/--schedule is used (default: headed)",
     )
 
+    # post-list-scheduled
+    pls_parser = subparsers.add_parser(
+        "post-list-scheduled",
+        help="List scheduled posts (Content Library > Scheduled tab)",
+    )
+    pls_parser.add_argument(
+        "--headless", action="store_true",
+        help="Run headless (default: headed)",
+    )
+
+    # post-delete-scheduled
+    pds_parser = subparsers.add_parser(
+        "post-delete-scheduled",
+        help="Delete a scheduled post by its 1-based index (from post-list-scheduled)",
+    )
+    pds_parser.add_argument("index", type=int, help="1-based index shown by post-list-scheduled")
+    pds_parser.add_argument(
+        "--headless", action="store_true",
+        help="Run headless (default: headed)",
+    )
+
     # comments
     comments_parser = subparsers.add_parser("comments", help="List unreplied comments")
     comments_parser.add_argument("--page", help="Page ID (default: from .env)")
@@ -636,6 +669,10 @@ def main():
 
     if args.command == "post":
         cmd_post(args)
+    elif args.command == "post-list-scheduled":
+        cmd_list_scheduled(args)
+    elif args.command == "post-delete-scheduled":
+        cmd_delete_scheduled(args)
     elif args.command == "comments":
         cmd_comments(args)
     elif args.command == "reply":
