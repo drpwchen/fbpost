@@ -16,3 +16,10 @@ fb = "scripts.fb:main"
 
 [tool.setuptools]
 packages = ["scripts"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+package = true

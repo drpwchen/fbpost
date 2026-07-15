@@ -345,6 +345,19 @@ async def send_message(profile: str, thread_id: str, text: str, headless: bool =
         # Text confirmed in input — send it
         await input_box.press("Enter")
         await page.wait_for_timeout(3000)
+
+        # POST-SEND: pressing Enter doesn't guarantee delivery (e.g. E2E not
+        # ready yet, box not focused). Confirm the input box actually cleared
+        # before reporting success — otherwise the text is still sitting there.
+        try:
+            remaining = await input_box.inner_text()
+        except Exception:
+            remaining = ""
+
+        if text in remaining:
+            print(f"FAILED: input box still contains the text after Enter — message was NOT sent.", file=sys.stderr)
+            sys.exit(1)
+
         print(f"Message sent: \"{text[:50]}{'...' if len(text) > 50 else ''}\"")
 
 
@@ -681,40 +694,44 @@ async def search_and_read(
         listbox_count = await listbox_items.count()
 
         clicked = False
+        seen_candidates = []
         if listbox_count > 0:
-            # Find the result matching our query
+            # Find the result matching our query — never guess: a search
+            # result that doesn't literally contain the query text is not
+            # confirmed to be the right person (this previously caused a
+            # message to be sent to the wrong contact when the fallback
+            # blindly clicked the first result).
             for i in range(min(listbox_count, 10)):
                 item = listbox_items.nth(i)
                 try:
                     text = await item.inner_text()
+                    seen_candidates.append(text.split("\n")[0].strip())
                     if query in text:
                         await item.click()
                         clicked = True
                         break
                 except Exception:
                     continue
-            if not clicked:
-                await listbox_items.first.click()
-                clicked = True
         elif result_count > 0:
             for i in range(min(result_count, 10)):
                 link = result_links.nth(i)
                 try:
                     text = await link.inner_text()
+                    seen_candidates.append(text.split("\n")[0].strip())
                     if query in text:
                         await link.click()
                         clicked = True
                         break
                 except Exception:
                     continue
-            if not clicked:
-                await result_links.first.click()
-                clicked = True
 
         if not clicked:
-            print(f"No results found for \"{query}\".")
+            print(f"No result whose text literally contains \"{query}\" — refusing to guess.", file=sys.stderr)
+            if seen_candidates:
+                print(f"Candidates seen: {seen_candidates}", file=sys.stderr)
+                print("Re-run search with one of these exact names, or use a thread ID directly.", file=sys.stderr)
             await save_storage_state(context, profile)
-            return
+            sys.exit(1)
 
         await page.wait_for_timeout(4000)
 

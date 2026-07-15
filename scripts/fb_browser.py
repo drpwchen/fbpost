@@ -374,18 +374,18 @@ async def capture_login(profile: str):
     print("Please log in manually. The browser will close automatically once logged in.")
     await page.goto("https://www.facebook.com/")
 
-    # Wait for successful login — poll URL until no /login
+    # Wait for successful login — poll for the c_user auth cookie, since the
+    # logged-out homepage is also at the bare facebook.com URL (no "/login"
+    # substring), which made URL-only checks fire immediately on page load.
     try:
         while True:
             await page.wait_for_timeout(2000)
-            url = page.url
-            if "facebook.com" in url and "/login" not in url and "checkpoint" not in url:
-                # Verify we can access the main page
-                if page.url.rstrip("/").endswith("facebook.com") or "/home" in page.url or "/?sk=" in page.url:
-                    break
-                # Also break if we're on any non-login facebook page
-                if "facebook.com" in page.url and "/login" not in page.url:
-                    break
+            cookies = await context.cookies()
+            if any(
+                c["name"] == "c_user" and "facebook.com" in c.get("domain", "")
+                for c in cookies
+            ):
+                break
     except Exception:
         pass
 
