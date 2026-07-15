@@ -1,10 +1,18 @@
-![GitHub stars](https://img.shields.io/github/stars/htlin222/fbpost?style=flat-square)
-![Last commit](https://img.shields.io/github/last-commit/htlin222/fbpost?style=flat-square)
-![License](https://img.shields.io/github/license/htlin222/fbpost?style=flat-square)
+![Last commit](https://img.shields.io/github/last-commit/drpwchen/fbpost?style=flat-square)
+![License](https://img.shields.io/github/license/drpwchen/fbpost?style=flat-square)
 
 # fbpost
 
 Facebook CLI tool — post, comments, replies, and Messenger automation via GraphQL API + Playwright.
+
+> **This is a maintained fork of [htlin222/fbpost](https://github.com/htlin222/fbpost)** (all credit for the original design to [@htlin222](https://github.com/htlin222)). This fork adds:
+>
+> - `fb post --image` (photo attachments) and `--schedule` (scheduled posts) via the composer UI
+> - `fb post-list-scheduled` / `fb post-delete-scheduled` — manage scheduled posts from the CLI
+> - A reliability sweep: daemon-safe teardown everywhere, cookie-based login verification, honest post-send verification (several code paths used to report success without checking), wrong-contact guards in `fb search`, Windows support fixes, and event-driven waits that cut 3-12s of fixed sleeps per command
+>
+> The reliability fixes and composer features are also submitted upstream as
+> [PR #1](https://github.com/htlin222/fbpost/pull/1) and [PR #2](https://github.com/htlin222/fbpost/pull/2).
 
 ## Setup
 
@@ -58,10 +66,10 @@ uv run fb comments
 uv run fb reply 0 "Thanks!"
 
 # Send a Messenger message (by name)
-uv run fb send 黃豆泥 "你好"
+uv run fb send Alice "你好"
 
 # Send a Messenger message (by thread ID)
-uv run fb send 9318393524851955 "你好"
+uv run fb send 1234567890123456 "你好"
 ```
 
 ## Commands
@@ -81,6 +89,10 @@ Schedule for later (drives the composer UI, headed by default):
 uv run fb post "Later post" --privacy EVERYONE --schedule "2026-07-17 11:00"
 ```
 
+The schedule time must be at least 10 minutes out (Facebook's minimum) and is
+interpreted in your FB account's timezone, which is assumed to match this
+machine's clock.
+
 ### Scheduled posts — List / Delete
 
 Scheduled posts live in the Professional Dashboard's Content Library
@@ -90,11 +102,18 @@ Business Suite is unavailable, so these commands drive that tab.
 ```bash
 uv run fb post-list-scheduled              # list scheduled posts with a 1-based index
 uv run fb post-delete-scheduled 2          # delete the post shown at index 2
+uv run fb post-delete-scheduled 2 --match "draft about cats"   # abort if row 2 doesn't contain this text
 ```
 
-`post-delete-scheduled` re-verifies that the scheduled count actually dropped
-before reporting success. Both are headed by default; add `--headless` to hide
-the browser.
+Both commands scroll until the lazy-loaded table stops growing, so the index
+covers ALL scheduled posts. `post-delete-scheduled` resolves the index freshly
+in its own session, prints exactly what it is about to delete, aborts if
+`--match` text isn't in that row, and re-verifies the scheduled count actually
+dropped before reporting success.
+
+Like the other read-only commands, `post-list-scheduled` is headless by
+default (`--no-headless` to watch). Deletion is destructive, so
+`post-delete-scheduled` is headed by default (`--headless` to hide).
 
 ### Comments
 
@@ -127,9 +146,9 @@ Opens a headed browser for manual login. Cookies and storage state are saved aut
 ### Messenger — Send
 
 ```bash
-uv run fb send 黃豆泥 "Hello!"              # by contact name (from cache)
-uv run fb send 9318393524851955 "Hello!"   # by thread ID
-uv run fb send 黃豆泥 "Hello!" --headless   # hidden browser (less reliable for E2E)
+uv run fb send Alice "Hello!"              # by contact name (from cache)
+uv run fb send 1234567890123456 "Hello!"   # by thread ID
+uv run fb send Alice "Hello!" --headless   # hidden browser (less reliable for E2E)
 ```
 
 Send defaults to **headed mode** (visible browser) for reliable E2E encryption handling. The flow:
@@ -148,9 +167,9 @@ uv run fb inbox --count 30 --no-headless
 ### Messenger — Read
 
 ```bash
-uv run fb read 黃豆泥                       # by name
-uv run fb read 9318393524851955            # by thread ID
-uv run fb read 黃豆泥 --count 50
+uv run fb read Alice                       # by name
+uv run fb read 1234567890123456            # by thread ID
+uv run fb read Alice --count 50
 ```
 
 ### Messenger — Search and Read
@@ -167,8 +186,8 @@ Searches Messenger, opens the matching thread, reads messages, and caches the co
 Scrolls through a thread to extract messages (handles Messenger's DOM virtualization):
 
 ```bash
-uv run fb history 黃豆泥 --days 30
-uv run fb history 黃豆泥 --days 14 --output chat.json
+uv run fb history Alice --days 30
+uv run fb history Alice --days 14 --output chat.json
 ```
 
 Output: `profiles/<profile>/chat_history_<thread_id>.json`
@@ -198,7 +217,7 @@ Keep a browser running for instant Messenger access (~6s per send):
 uv run fb daemon
 
 # Terminal 2: send messages (auto-connects to daemon)
-uv run fb send 黃豆泥 "Hello!" --headless
+uv run fb send Alice "Hello!" --headless
 ```
 
 ## Cookie Profiles
@@ -246,6 +265,7 @@ profiles/
 
 ## Notes
 
+- **The composer and scheduled-post automation targets Facebook's Traditional Chinese (zh-TW) UI** — the composer, audience, and schedule selectors are zh-TW labels. If your Facebook display language isn't 繁體中文, those flows will fail at the first zh-TW-labeled step (text-only `fb post` via GraphQL is language-independent).
 - GraphQL doc IDs in `fb_config.py` may change when Facebook deploys new frontend code. Update them when requests start returning errors.
 - E2E threads use the URL path `/messages/e2ee/t/<id>/` automatically for numeric thread IDs > 15 digits.
 - Send defaults to headed mode. Use `--headless` only after verifying your E2E PIN session is active.
