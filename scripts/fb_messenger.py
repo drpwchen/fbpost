@@ -662,8 +662,53 @@ async def discover_e2ee_contacts(
         await _teardown(p, browser, context, page)
 
 
+async def _restore_e2ee_messages(page, profile: str = "default") -> bool:
+    """Restore an E2EE thread's recent messages that FB hides behind
+    「訊息遺失。立即還原」(Messages lost. Restore now).
+
+    `fb read` alone only shows OLD (pre-secure-storage) messages and stops at
+    the restore wall — the recent messages need: click 立即還原 → enter the
+    saved PIN → wait. The 立即還原 button sits under a light-mode overlay that
+    makes Playwright's actionability click hang ~30s, so we click it via JS
+    (fires instantly, same isTrusted=false as the synthetic click that works).
+    The 6-digit PIN lives in profiles/<profile>/config.json {"pincode": …}.
+    """
+    async def _click_restore():
+        return await page.evaluate(
+            """() => {
+              const els = [...document.querySelectorAll('div[role=button], a[role=button], span, div')];
+              const t = els.find(e => {
+                const s = (e.innerText || '').trim();
+                return s === '立即還原' || s === 'Restore now' || s === 'Restore';
+              });
+              if (t) { t.click(); return true; }
+              return false;
+            }"""
+        )
+
+    # The 立即還原 button may not be rendered the instant we land — poll for it.
+    restored = False
+    for _ in range(8):
+        if await _click_restore():
+            await page.wait_for_timeout(1500)
+            if await handle_pin_dialog(page, profile):
+                restored = True
+            await page.wait_for_timeout(3000)
+            # a thread can show more than one 訊息遺失 marker → keep clearing
+            continue
+        if restored:
+            break
+        await page.wait_for_timeout(1000)  # wait for the restore prompt to appear
+    return restored
+
+
 async def _dismiss_dialogs(page, profile: str = "default"):
     """Dismiss any blocking dialogs (e.g. E2E encryption PIN prompt)."""
+    # E2EE thread: click 立即還原 + auto-enter PIN so recent messages load
+    if "/e2ee/" in page.url:
+        if await _restore_e2ee_messages(page, profile):
+            return True
+
     # First try entering PIN if the dialog is for E2E encryption
     if await handle_pin_dialog(page, profile):
         return True
@@ -839,6 +884,33 @@ async def search_and_read(
         await _teardown(p, browser, context, page)
 
 
+async def _extract_e2ee_from_main(page, count: int) -> list[str]:
+    """Extract messages from an E2EE thread via the main panel's a11y labels.
+
+    E2EE message bubbles are NOT `div[role=row]`, so `_extract_messages`
+    returns 0 for them. But FB mirrors every message into an accessibility
+    string of the form「輸入，訊息已在<time>由<sender>傳送：<content>」inside
+    div[role=main] — cleaner than the rows (carries sender + timestamp).
+    """
+    txt = await page.evaluate(
+        "() => { const m = document.querySelector('div[role=main]');"
+        " return m ? m.innerText : ''; }"
+    )
+    if not txt:
+        return []
+    messages = []
+    for line in txt.split("\n"):
+        line = line.strip()
+        m = re.match(r'^輸入，訊息已在(.+?)由(.+?)傳送(?:：(.*))?$', line)
+        if not m:
+            continue
+        when, sender, content = m.group(1), m.group(2), (m.group(3) or "").strip()
+        if not content or "端對端加密" in content or "訊息遺失" in content:
+            continue  # attachments / system notices carry no readable text
+        messages.append(f"[{sender} · {when}] {content}")
+    return messages[-count:] if count else messages
+
+
 async def _extract_messages(page, count: int) -> list[str]:
     """Extract messages from the current Messenger thread view."""
     # Messages are in role="row" elements within the message list
@@ -896,7 +968,23 @@ async def read_thread(
         except Exception:
             pass  # empty thread is valid; extraction handles it
 
-        messages = await _extract_messages(page, count)
+        # E2EE bubbles aren't role=row — parse the main panel's a11y labels,
+        # which also carry sender + timestamp. Fall back to rows if empty.
+        messages = []
+        if "/e2ee/" in page.url:
+            # After a PIN restore the recent (post-secure-storage) messages take
+            # a few seconds to decrypt into the DOM — poll until the count is
+            # stable so we don't grab only the stale pre-restore block.
+            prev = -1
+            for _ in range(8):
+                cur = await _extract_e2ee_from_main(page, 0)
+                if len(cur) == prev and len(cur) > 0:
+                    break
+                prev = len(cur)
+                await page.wait_for_timeout(1500)
+            messages = await _extract_e2ee_from_main(page, count)
+        if not messages:
+            messages = await _extract_messages(page, count)
 
         # Print messages
         print()
