@@ -971,12 +971,13 @@ async def _history_state(page):
 
 
 async def export_content_report(profile: str, out_path: str, headless: bool = True,
-                                timeout_s: int = 240):
-    """Create a content data report (revenue metrics EXCLUDED) and download the CSV.
+                                timeout_s: int = 240, include_revenue: bool = False):
+    """Create a content data report and download the CSV.
 
     Flow: 匯出資料 → 建立資料報告 → 顯示進階設定 → 顯示的衡量指標 → uncheck all
     收益* metrics (checked revenue metrics silently DROP every column after them
-    in the export) → 建立報告（.csv） → poll 報告紀錄 until a new entry is
+    in the export — pass include_revenue=True to keep them at your own risk)
+    → 建立報告（.csv） → poll 報告紀錄 until a new entry is
     已完成 → click its 下載 link and save the CSV to `out_path`.
 
     Date range is the dashboard default (past 28 days). Timestamps in the CSV
@@ -1004,28 +1005,35 @@ async def export_content_report(profile: str, out_path: str, headless: bool = Tr
         await dlg.get_by_role("switch", name=_ADVANCED_SWITCH).click(timeout=8000)
         await dlg.get_by_role("button", name=_METRICS_BUTTON).click(timeout=8000)
         await page.wait_for_timeout(1500)
-        boxes = dlg.get_by_role("checkbox")
-        unchecked = []
-        for i in range(await boxes.count()):
-            el = boxes.nth(i)
-            name = (await el.get_attribute("aria-label")) or ""
-            if not name.strip():
-                try:
-                    name = await el.inner_text()
-                except Exception:
-                    name = ""
-            name = " ".join(name.split())
-            if name.startswith(_REVENUE_PREFIX) and (await el.get_attribute("aria-checked")) == "true":
-                await el.click(timeout=5000)
-                unchecked.append(name)
-        if unchecked:
-            print(f"Excluded metrics: {', '.join(unchecked)}")
-        else:
+        if include_revenue:
             print(
-                "Warning: no checked 收益 metric found — if any stays checked, "
-                "columns after it are silently dropped from the CSV.",
+                "Warning: keeping 收益 metrics — Facebook's export silently drops "
+                "every column after them; expect a truncated CSV.",
                 file=sys.stderr,
             )
+        else:
+            boxes = dlg.get_by_role("checkbox")
+            unchecked = []
+            for i in range(await boxes.count()):
+                el = boxes.nth(i)
+                name = (await el.get_attribute("aria-label")) or ""
+                if not name.strip():
+                    try:
+                        name = await el.inner_text()
+                    except Exception:
+                        name = ""
+                name = " ".join(name.split())
+                if name.startswith(_REVENUE_PREFIX) and (await el.get_attribute("aria-checked")) == "true":
+                    await el.click(timeout=5000)
+                    unchecked.append(name)
+            if unchecked:
+                print(f"Excluded metrics: {', '.join(unchecked)}")
+            else:
+                print(
+                    "Warning: no checked 收益 metric found — if any stays checked, "
+                    "columns after it are silently dropped from the CSV.",
+                    file=sys.stderr,
+                )
         await dlg.get_by_role("button", name=_CREATE_CSV_BUTTON).click(timeout=8000)
         for _ in range(30):
             if not await page.get_by_role("dialog").count():

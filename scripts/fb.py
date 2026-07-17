@@ -201,6 +201,7 @@ def cmd_report(args):
     out = args.out or f"fb_report_{datetime.now().strftime('%Y-%m-%d')}.csv"
     asyncio.run(export_content_report(
         args.profile, out, headless=not args.no_headless, timeout_s=args.timeout,
+        include_revenue=args.include_revenue,
     ))
 
 
@@ -637,6 +638,10 @@ def main():
     report_parser.add_argument("--out", help="Output CSV path (default: fb_report_YYYY-MM-DD.csv)")
     report_parser.add_argument("--timeout", type=int, default=240,
                                help="Seconds to wait for report generation (default: 240)")
+    report_parser.add_argument(
+        "--include-revenue", action="store_true",
+        help="Keep 收益 metrics (WARNING: FB's export silently drops every column after them)",
+    )
     report_parser.add_argument("--no-headless", action="store_true", help="Show the browser")
 
     # reply

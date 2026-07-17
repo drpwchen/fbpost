@@ -9,6 +9,7 @@ Facebook CLI tool — post, comments, replies, and Messenger automation via Grap
 >
 > - `fb post --image` (photo attachments) and `--schedule` (scheduled posts) via the composer UI
 > - `fb post-list-scheduled` / `fb post-delete-scheduled` — manage scheduled posts from the CLI
+> - `fb report` — create and download a Professional Dashboard content data report (CSV) in one command, plus `scripts/report_to_md.py` to turn it into a markdown tracking table
 > - A reliability sweep: daemon-safe teardown everywhere, cookie-based login verification, honest post-send verification (several code paths used to report success without checking), wrong-contact guards in `fb search`, Windows support fixes, and event-driven waits that cut 3-12s of fixed sleeps per command
 >
 > The reliability fixes and composer features are also submitted upstream as
@@ -114,6 +115,31 @@ dropped before reporting success.
 Like the other read-only commands, `post-list-scheduled` is headless by
 default (`--no-headless` to watch). Deletion is destructive, so
 `post-delete-scheduled` is headed by default (`--headless` to hide).
+
+### Content data report (post analytics export)
+
+Automates the Professional Dashboard export flow (匯出資料 → 建立資料報告 →
+poll 報告紀錄 → download) and saves the CSV — one row per post with views,
+reach, engagement, reactions, comments, saves, and shares:
+
+```bash
+uv run fb report                           # saves fb_report_YYYY-MM-DD.csv
+uv run fb report --out my_report.csv       # custom output path
+uv run fb report --timeout 360             # wait longer for report generation
+```
+
+**Revenue metrics are excluded by default, on purpose**: Facebook's export
+has a bug where any checked 收益 (revenue) metric silently drops every column
+after it from the CSV. If your profile is monetized and you accept a
+truncated export, opt back in with `--include-revenue`.
+
+Two gotchas the command already handles, worth knowing about:
+
+- The date range is the dashboard default (**past 28 days**) — keep your own
+  history if you need older data.
+- **Timestamps in the CSV are US Pacific time**, not your local timezone.
+  `scripts/report_to_md.py <report.csv>` converts them to Taipei (+15h) and
+  emits a markdown table; adapt the offset for your timezone.
 
 ### Comments
 
