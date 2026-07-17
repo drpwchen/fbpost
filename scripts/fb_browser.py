@@ -4,7 +4,9 @@ import asyncio
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -913,5 +915,195 @@ async def delete_scheduled_post(profile: str, index: int, headless: bool = False
                 file=sys.stderr,
             )
             sys.exit(1)
+    finally:
+        await _teardown(p, browser, context, page)
+
+
+# ---------------------------------------------------------------------------
+# Content data report (匯出資料 → 建立資料報告 / 報告紀錄)
+# ---------------------------------------------------------------------------
+
+_EXPORT_BUTTON = "匯出資料"
+_CREATE_REPORT_MENUITEM = "建立資料報告"
+_REPORT_HISTORY_MENUITEM = "報告紀錄"
+_ADVANCED_SWITCH = "顯示進階設定"
+_METRICS_BUTTON = "顯示的衡量指標"
+_CREATE_CSV_BUTTON = "建立報告（.csv）"
+_REVENUE_PREFIX = "收益"
+_REPORT_DONE = "已完成"
+
+
+async def _open_export_menu(page, item: str):
+    """Open the 匯出資料 menu and pick one of its menu items."""
+    await page.get_by_role("button", name=_EXPORT_BUTTON).first.click(timeout=10000)
+    mi = page.get_by_role("menuitem", name=item)
+    await mi.first.wait_for(state="visible", timeout=10000)
+    await mi.first.click(timeout=5000)
+    await page.wait_for_timeout(1500)
+
+
+async def _close_any_dialog(page):
+    """Close whatever dialog is open (關閉 button, Escape as fallback)."""
+    dialogs = page.get_by_role("dialog")
+    if await dialogs.count():
+        btn = dialogs.last.get_by_role("button", name="關閉")
+        try:
+            if await btn.count():
+                await btn.first.click(timeout=3000)
+            else:
+                await page.keyboard.press("Escape")
+        except Exception:
+            await page.keyboard.press("Escape")
+    for _ in range(10):
+        if not await page.get_by_role("dialog").count():
+            return
+        await page.wait_for_timeout(300)
+
+
+async def _history_state(page):
+    """With the 報告紀錄 dialog open, return (download_links, entry_count, first_entry_text)."""
+    dlg = page.get_by_role("dialog").last
+    links = dlg.get_by_role("link")
+    count = await links.count()
+    text = " ".join((await dlg.inner_text()).split())
+    first_entry = text.split("下載")[0] if "下載" in text else text
+    return links, count, first_entry
+
+
+async def export_content_report(profile: str, out_path: str, headless: bool = True,
+                                timeout_s: int = 240):
+    """Create a content data report (revenue metrics EXCLUDED) and download the CSV.
+
+    Flow: 匯出資料 → 建立資料報告 → 顯示進階設定 → 顯示的衡量指標 → uncheck all
+    收益* metrics (checked revenue metrics silently DROP every column after them
+    in the export) → 建立報告（.csv） → poll 報告紀錄 until a new entry is
+    已完成 → click its 下載 link and save the CSV to `out_path`.
+
+    Date range is the dashboard default (past 28 days). Timestamps in the CSV
+    are US Pacific — convert with scripts/report_to_md.py (+15h to Taipei).
+    """
+    p, browser, context = await create_browser_context(profile, headless, persistent=False)
+    page = None
+    try:
+        page = await context.new_page()
+        await page.goto(CONTENT_LIBRARY_URL, wait_until="domcontentloaded", timeout=30000)
+        if not await verify_login(page):
+            print("Error: Not logged in. Run 'fb login' first.", file=sys.stderr)
+            sys.exit(1)
+        await page.wait_for_timeout(3000)
+
+        # Baseline: number of reports already in history, so we can tell the
+        # new one apart from an older same-day report.
+        await _open_export_menu(page, _REPORT_HISTORY_MENUITEM)
+        _, baseline, _ = await _history_state(page)
+        await _close_any_dialog(page)
+
+        # Configure and request the report.
+        await _open_export_menu(page, _CREATE_REPORT_MENUITEM)
+        dlg = page.get_by_role("dialog").last
+        await dlg.get_by_role("switch", name=_ADVANCED_SWITCH).click(timeout=8000)
+        await dlg.get_by_role("button", name=_METRICS_BUTTON).click(timeout=8000)
+        await page.wait_for_timeout(1500)
+        boxes = dlg.get_by_role("checkbox")
+        unchecked = []
+        for i in range(await boxes.count()):
+            el = boxes.nth(i)
+            name = (await el.get_attribute("aria-label")) or ""
+            if not name.strip():
+                try:
+                    name = await el.inner_text()
+                except Exception:
+                    name = ""
+            name = " ".join(name.split())
+            if name.startswith(_REVENUE_PREFIX) and (await el.get_attribute("aria-checked")) == "true":
+                await el.click(timeout=5000)
+                unchecked.append(name)
+        if unchecked:
+            print(f"Excluded metrics: {', '.join(unchecked)}")
+        else:
+            print(
+                "Warning: no checked 收益 metric found — if any stays checked, "
+                "columns after it are silently dropped from the CSV.",
+                file=sys.stderr,
+            )
+        await dlg.get_by_role("button", name=_CREATE_CSV_BUTTON).click(timeout=8000)
+        for _ in range(30):
+            if not await page.get_by_role("dialog").count():
+                break
+            await page.wait_for_timeout(500)
+        print("Report requested; polling 報告紀錄 for completion...")
+
+        # Poll history until the NEW report is 已完成, then download it.
+        now = datetime.now()
+        today_str = f"於{now.year}/{now.month}/{now.day}產生"
+        requested_at = time.time()
+        deadline = requested_at + timeout_s
+        last_err = ""
+        while True:
+            try:
+                # Reload fresh each poll — while a report is generating, the
+                # header/匯出資料 control can be temporarily absent or replaced,
+                # so any single failed attempt just means "retry next round".
+                await page.goto(CONTENT_LIBRARY_URL, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(3000)
+                await _open_export_menu(page, _REPORT_HISTORY_MENUITEM)
+                links, count, first_entry = await _history_state(page)
+            except Exception as e:
+                last_err = str(e).splitlines()[0][:120]
+                if time.time() > deadline:
+                    print(
+                        f"FAILED: report polling kept erroring until timeout "
+                        f"({timeout_s}s). Last error: {last_err}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                await _close_any_dialog(page)
+                await page.wait_for_timeout(6000)
+                continue
+            fresh = count > baseline
+            done = today_str in first_entry and _REPORT_DONE in first_entry
+            if done and not fresh and time.time() > requested_at + 45:
+                # The history list caps how many entries it shows, so the
+                # count can't grow past the cap. A completed same-day report
+                # at the top is the one we just requested (or its identical
+                # same-day twin) — take it rather than stalling.
+                fresh = True
+            if fresh and done:
+                # The 下載 link opens an l.facebook.com redirect in a new tab,
+                # which never surfaces as a page-level download event. The CDN
+                # URL is signed (works without cookies) — unwrap and GET it.
+                href = await links.first.get_attribute("href")
+                if not href:
+                    print("FAILED: download link has no href.", file=sys.stderr)
+                    sys.exit(1)
+                if "/l.php" in href:
+                    q = parse_qs(urlparse(href).query)
+                    href = q.get("u", [href])[0]
+                resp = await page.request.get(href)
+                if not resp.ok:
+                    print(f"FAILED: download GET returned {resp.status}.", file=sys.stderr)
+                    sys.exit(1)
+                body = await resp.body()
+                head = body[:200].decode("utf-8-sig", errors="replace")
+                if "貼文編號" not in head and "," not in head:
+                    print(
+                        f"FAILED: downloaded content does not look like the report CSV "
+                        f"(starts with: {head[:80]!r}).",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                with open(out_path, "wb") as f:
+                    f.write(body)
+                print(f"Saved: {out_path}")
+                return
+            if time.time() > deadline:
+                print(
+                    f"FAILED: report not completed within {timeout_s}s "
+                    f"(history entries {baseline} -> {count}; newest: {first_entry[:120]}).",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            await _close_any_dialog(page)
+            await page.wait_for_timeout(6000)
     finally:
         await _teardown(p, browser, context, page)

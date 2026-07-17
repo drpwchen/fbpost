@@ -195,6 +195,15 @@ def cmd_delete_scheduled(args):
     ))
 
 
+def cmd_report(args):
+    """Create + download a content data report CSV from the Professional Dashboard."""
+    from scripts.fb_browser import export_content_report
+    out = args.out or f"fb_report_{datetime.now().strftime('%Y-%m-%d')}.csv"
+    asyncio.run(export_content_report(
+        args.profile, out, headless=not args.no_headless, timeout_s=args.timeout,
+    ))
+
+
 def cmd_comments(args):
     """List unreplied comments from Professional Dashboard."""
     cookies = load_cookies(args.profile)
@@ -620,6 +629,16 @@ def main():
     )
     comments_parser.add_argument("--next", action="store_true", help="Fetch next page")
 
+    # report
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Create + download a content data report CSV (revenue metrics excluded)",
+    )
+    report_parser.add_argument("--out", help="Output CSV path (default: fb_report_YYYY-MM-DD.csv)")
+    report_parser.add_argument("--timeout", type=int, default=240,
+                               help="Seconds to wait for report generation (default: 240)")
+    report_parser.add_argument("--no-headless", action="store_true", help="Show the browser")
+
     # reply
     reply_parser = subparsers.add_parser("reply", help="Reply to a comment")
     reply_parser.add_argument("id", help="Comment index (from 'comments' list) or base64 comment ID")
@@ -682,6 +701,8 @@ def main():
         cmd_list_scheduled(args)
     elif args.command == "post-delete-scheduled":
         cmd_delete_scheduled(args)
+    elif args.command == "report":
+        cmd_report(args)
     elif args.command == "comments":
         cmd_comments(args)
     elif args.command == "reply":
