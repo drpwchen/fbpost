@@ -9,7 +9,7 @@ import os
 import re
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from scripts.fb_config import COMMENTS_DOC_ID, POST_DOC_ID, REPLY_DOC_ID
 from scripts.fb_session import (
@@ -35,11 +35,122 @@ def _last_comments_file(profile: str = "default") -> str:
 
 # ── Post ─────────────────────────────────────────────────────────────────────
 
+def _parse_schedule(schedule_at: str) -> int:
+    """Parse 'YYYY-MM-DD HH:MM' into epoch seconds, enforcing FB's ~10-minute
+    minimum lead time. The epoch is absolute, so unlike the old composer path
+    (which typed the time as text) there is no account-timezone ambiguity."""
+    try:
+        dt = datetime.strptime(schedule_at, "%Y-%m-%d %H:%M")
+    except ValueError:
+        print(
+            f"Error: --schedule must be 'YYYY-MM-DD HH:MM' (24hr), got {schedule_at!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if dt <= datetime.now() + timedelta(minutes=10):
+        print(
+            "Error: --schedule time must be at least 10 minutes in the future "
+            "(Facebook's minimum).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return int(dt.timestamp())
+
+
+def _resolve_post_id(raw: str) -> str:
+    """Accept a numeric post_id or a base64 story_id (UzpfS… = 'S:_I<user>:<post>')
+    and return the numeric post_id."""
+    if raw.isdigit():
+        return raw
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8")
+        # "S:_I<user_id>:<post_id>" — take the trailing numeric segment
+        tail = decoded.rsplit(":", 1)[-1]
+        if tail.isdigit():
+            return tail
+    except Exception:
+        pass
+    print(
+        f"Error: cannot resolve post id from {raw!r} — pass the numeric post_id "
+        "printed by 'fb post'.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _create_comment(session, tokens, actor_id, post_id: str, text: str):
+    """Create a TOP-LEVEL comment on one of our own posts via GraphQL.
+
+    Works on scheduled (unpublished) posts too — feedback:<post_id> resolves
+    before publish, which is what lets us pre-write the URL comment the user
+    parks under each post. Exits non-zero unless FB returns the created
+    comment edge (no blind success)."""
+    feedback_id = base64.b64encode(f"feedback:{post_id}".encode()).decode()
+    session_id = str(uuid.uuid4())
+    variables = {
+        "feedLocation": "DEDICATED_COMMENTING_SURFACE",
+        "feedbackSource": 110,
+        "groupID": None,
+        "input": {
+            "actor_id": actor_id,
+            "client_mutation_id": "1",
+            "attachments": None,
+            "feedback_id": feedback_id,
+            "formatting_style": None,
+            "message": {"ranges": [], "text": text},
+            "attribution_id_v2": f"CometFocusedStoryViewRoot.react,comet.focused_story_view,unexpected,{int(datetime.now().timestamp() * 1000)},536197,,,;",
+            "vod_video_timestamp": None,
+            "is_tracking_encrypted": True,
+            "tracking": [],
+            "feedback_source": "DEDICATED_COMMENTING_SURFACE",
+            "idempotence_token": f"client:{uuid.uuid4()}",
+            "session_id": session_id,
+        },
+        "inviteShortLinkKey": None,
+        "renderLocation": None,
+        "scale": 2,
+        "useDefaultActor": False,
+        "focusCommentID": None,
+        **REPLY_RELAY_PV_FLAGS,
+    }
+
+    data = graphql_request(
+        session, tokens, actor_id, REPLY_DOC_ID,
+        "useCometUFICreateCommentMutation", variables,
+    )
+    if "errors" in data:
+        print("Error from Facebook while commenting:", file=sys.stderr)
+        print(json.dumps(data["errors"], indent=2, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+    cc = (data.get("data") or {}).get("comment_create") or {}
+    node = (cc.get("feedback_comment_edge") or {}).get("node") or {}
+    body = (node.get("preferred_body") or node.get("body") or {}).get("text", "")
+    if node.get("id") and text in body:
+        print(f"Comment created on post {post_id}: {text}")
+    else:
+        print(
+            "FAILED: Facebook did not return the created comment — "
+            "comment may NOT have been posted.",
+            file=sys.stderr,
+        )
+        print(json.dumps(data, ensure_ascii=False)[:800], file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_post(args):
     """Post text to Facebook."""
-    if args.image or args.schedule:
-        # Photo attachment and scheduling aren't supported by the raw
-        # GraphQL mutation below — drive the real composer UI instead.
+    if args.image:
+        # Photo upload isn't supported by the raw GraphQL mutation below —
+        # drive the real composer UI instead. (Scheduling IS GraphQL now:
+        # unpublished_content_data on ComposerStoryCreateMutation.)
+        if args.comment:
+            print(
+                "Error: --comment needs the GraphQL post path and can't be "
+                "combined with --image (composer posts don't return a post_id). "
+                "Post first, then use 'fb comment <post_id> \"text\"'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         from scripts.fb_browser import post_via_composer
         asyncio.run(post_via_composer(
             args.profile, args.text,
@@ -49,6 +160,8 @@ def cmd_post(args):
             headless=args.headless,
         ))
         return
+
+    schedule_epoch = _parse_schedule(args.schedule) if args.schedule else None
 
     cookies = load_cookies(args.profile)
     actor_id = cookies["actor_id"]
@@ -117,7 +230,15 @@ def cmd_post(args):
         **POST_RELAY_PV_FLAGS,
     }
 
-    print(f"\nPosting to Facebook (privacy: {args.privacy})...")
+    if schedule_epoch:
+        variables["input"]["unpublished_content_data"] = {
+            "scheduled_publish_time": schedule_epoch,
+            "unpublished_content_type": "SCHEDULED",
+        }
+        print(f"\nScheduling post for {args.schedule} (privacy: {args.privacy})...")
+    else:
+        print(f"\nPosting to Facebook (privacy: {args.privacy})...")
+
     data = graphql_request(
         session, tokens, actor_id, POST_DOC_ID,
         "ComposerStoryCreateMutation", variables,
@@ -128,8 +249,20 @@ def cmd_post(args):
         print(json.dumps(data["errors"], indent=2), file=sys.stderr)
         sys.exit(1)
 
-    story = data.get("data", {}).get("story_create", {}).get("story")
-    if story:
+    story_create = data.get("data", {}).get("story_create") or {}
+    post_id = story_create.get("post_id")
+    story = story_create.get("story")
+    if post_id:
+        if schedule_epoch:
+            print(f"\nSuccess! Post scheduled for {args.schedule}.")
+        else:
+            print("\nSuccess! Story created.")
+        print(f"  Post ID: {post_id}")
+        if story_create.get("story_id"):
+            print(f"  Story ID: {story_create['story_id']}")
+        if story and story.get("url"):
+            print(f"  URL: {story['url']}")
+    elif story:
         print("\nSuccess! Story created.")
         print(f"  Story ID: {story.get('id', 'unknown')}")
         if story.get("url"):
@@ -137,6 +270,16 @@ def cmd_post(args):
     else:
         print("\nRequest sent. Response:")
         print(json.dumps(data, indent=2)[:1000])
+        if args.comment:
+            print(
+                "Skipping --comment: no post_id returned to attach it to.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if args.comment and post_id:
+        print()
+        _create_comment(session, tokens, actor_id, str(post_id), args.comment)
 
 
 # ── Comments ─────────────────────────────────────────────────────────────────
@@ -383,6 +526,20 @@ def cmd_comments(args):
     print(f"  Reply with: uv run fb.py{profile_flag} reply <#> \"your reply\"")
 
 
+# ── Comment (top-level, incl. scheduled posts) ──────────────────────────────
+
+def cmd_comment(args):
+    """Create a top-level comment on one of our own posts (works on scheduled
+    posts before they publish — the URL-in-comments habit)."""
+    post_id = _resolve_post_id(args.post_id)
+    cookies = load_cookies(args.profile)
+    actor_id = cookies["actor_id"]
+    session = create_session(cookies)
+    print("Fetching tokens from Facebook...")
+    tokens = fetch_tokens(session)
+    _create_comment(session, tokens, actor_id, post_id, args.text)
+
+
 # ── Reply ────────────────────────────────────────────────────────────────────
 
 def cmd_reply(args):
@@ -586,14 +743,30 @@ def main():
     )
     post_parser.add_argument(
         "--schedule",
-        help="Schedule for later, 'YYYY-MM-DD HH:MM' 24hr, at least 10 minutes out; "
-        "interpreted in your FB account's timezone (assumed to match this machine). "
-        "Routes through the browser composer.",
+        help="Schedule for later, 'YYYY-MM-DD HH:MM' 24hr local time, at least "
+        "10 minutes out. Sent via GraphQL (absolute epoch — no timezone "
+        "ambiguity) unless --image forces the browser composer.",
+    )
+    post_parser.add_argument(
+        "--comment",
+        help="After posting/scheduling, pre-write this as a top-level comment "
+        "on the new post (e.g. the article URL). GraphQL path only (not with --image).",
     )
     post_parser.add_argument(
         "--headless", action="store_true",
-        help="Run headless when --image/--schedule is used (default: headed)",
+        help="Run headless when --image is used (default: headed)",
     )
+
+    # comment (top-level comment on own post, incl. scheduled posts)
+    comment_parser = subparsers.add_parser(
+        "comment",
+        help="Add a top-level comment to one of your own posts (works on scheduled posts)",
+    )
+    comment_parser.add_argument(
+        "post_id",
+        help="Numeric post_id (printed by 'fb post') or base64 story_id (UzpfS…)",
+    )
+    comment_parser.add_argument("text", help="Comment text")
 
     # post-list-scheduled (read-only -> headless by default, like inbox/read)
     pls_parser = subparsers.add_parser(
@@ -708,6 +881,8 @@ def main():
         cmd_delete_scheduled(args)
     elif args.command == "report":
         cmd_report(args)
+    elif args.command == "comment":
+        cmd_comment(args)
     elif args.command == "comments":
         cmd_comments(args)
     elif args.command == "reply":

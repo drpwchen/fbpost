@@ -3,6 +3,29 @@
 All notable changes to this fork are documented here.
 Upstream: [htlin222/fbpost](https://github.com/htlin222/fbpost).
 
+## [0.3.0] - 2026-07-18
+
+### Added
+
+- `fb post --comment "text"` — after creating/scheduling a post, pre-write a
+  top-level comment on it in the same command. Works on scheduled posts
+  before they publish (the "link in comments" pattern): `feedback:<post_id>`
+  resolves pre-publish, so the comment is already there when the post goes
+  live. Verified against the returned comment edge — no blind success.
+- `fb comment <post_id> "text"` — standalone top-level comment on any of your
+  own posts; accepts the numeric post_id printed by `fb post` or the base64
+  story ID.
+
+### Changed
+
+- `fb post --schedule` now goes through pure GraphQL
+  (`unpublished_content_data` on `ComposerStoryCreateMutation`) instead of
+  driving the browser composer. No more zh-TW selector dependency or
+  composer-popup flakiness for scheduling; the time is sent as an absolute
+  epoch (no account-timezone ambiguity), and the command prints the new
+  post's post_id/story_id. `--image` still uses the composer (photo upload
+  has no GraphQL fast path).
+
 ## [0.2.0] - 2026-07-17
 
 ### Added

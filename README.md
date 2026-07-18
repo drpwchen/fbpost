@@ -7,7 +7,8 @@ Facebook CLI tool — post, comments, replies, and Messenger automation via Grap
 
 > **This is a maintained fork of [htlin222/fbpost](https://github.com/htlin222/fbpost)** (all credit for the original design to [@htlin222](https://github.com/htlin222)). This fork adds:
 >
-> - `fb post --image` (photo attachments) and `--schedule` (scheduled posts) via the composer UI
+> - `fb post --image` (photo attachments) via the composer UI and `--schedule` (scheduled posts) via pure GraphQL
+> - `fb post --comment` / `fb comment` — pre-write a top-level comment on a post, including scheduled posts before they publish ("link in comments")
 > - `fb post-list-scheduled` / `fb post-delete-scheduled` — manage scheduled posts from the CLI
 > - `fb report` — create and download a Professional Dashboard content data report (CSV) in one command, plus `scripts/report_to_md.py` to turn it into a markdown tracking table
 > - A reliability sweep: daemon-safe teardown everywhere, cookie-based login verification, honest post-send verification (several code paths used to report success without checking), wrong-contact guards in `fb search`, Windows support fixes, and event-driven waits that cut 3-12s of fixed sleeps per command
@@ -84,15 +85,31 @@ uv run fb --profile fanpage post "Hello from page" --privacy EVERYONE
 
 Options: `--privacy SELF|FRIENDS|EVERYONE` (default: `SELF`)
 
-Schedule for later (drives the composer UI, headed by default):
+Schedule for later (pure GraphQL — no browser, no zh-TW selector dependency):
 
 ```bash
-uv run fb post "Later post" --privacy EVERYONE --schedule "2026-07-17 11:00"
+uv run fb post "Later post" --privacy EVERYONE --schedule "2026-07-18 11:00"
 ```
 
 The schedule time must be at least 10 minutes out (Facebook's minimum) and is
-interpreted in your FB account's timezone, which is assumed to match this
-machine's clock.
+your machine's local time, sent as an absolute epoch — no account-timezone
+ambiguity. Only `--image` still routes through the browser composer (photo
+upload has no GraphQL fast path), where the time is typed into the zh-TW UI.
+
+Pre-write a comment on the new post in the same command — handy for the
+"link in comments" habit; it works on scheduled posts before they publish:
+
+```bash
+uv run fb post "Post text" --privacy EVERYONE \
+  --schedule "2026-07-18 11:00" --comment "https://example.com/article"
+```
+
+Or comment on any of your own posts later (numeric post_id printed by
+`fb post`, or the base64 story ID):
+
+```bash
+uv run fb comment 1234567890123456 "https://example.com/article"
+```
 
 ### Scheduled posts — List / Delete
 
@@ -291,7 +308,7 @@ profiles/
 
 ## Notes
 
-- **The composer and scheduled-post automation targets Facebook's Traditional Chinese (zh-TW) UI** — the composer, audience, and schedule selectors are zh-TW labels. If your Facebook display language isn't 繁體中文, those flows will fail at the first zh-TW-labeled step (text-only `fb post` via GraphQL is language-independent).
+- **The browser-driven flows (`--image` posts, scheduled-post list/delete, `fb report`) target Facebook's Traditional Chinese (zh-TW) UI** — their selectors are zh-TW labels. If your Facebook display language isn't 繁體中文, those flows will fail at the first zh-TW-labeled step. `fb post` (including `--schedule` and `--comment`), `fb comment`, `fb comments`, and `fb reply` are pure GraphQL and language-independent.
 - GraphQL doc IDs in `fb_config.py` may change when Facebook deploys new frontend code. Update them when requests start returning errors.
 - E2E threads use the URL path `/messages/e2ee/t/<id>/` automatically for numeric thread IDs > 15 digits.
 - Send defaults to headed mode. Use `--headless` only after verifying your E2E PIN session is active.
