@@ -575,13 +575,34 @@ async def post_via_composer(
         # doing anything else (same discipline as send_message in fb_messenger.py).
         step = "typing the post text"
         await textbox.click(timeout=5000)
-        await textbox.type(text, delay=20, timeout=15000)
+        # Typing is per-character, so the timeout must scale with the text —
+        # a fixed 15s silently caps posts at ~750 chars.
+        type_delay = 20
+        type_timeout = max(30000, len(text) * type_delay * 3)
+        await textbox.type(text, delay=type_delay, timeout=type_timeout)
         await page.wait_for_timeout(500)
         try:
             input_text = await textbox.inner_text()
         except Exception:
             input_text = ""
-        if text not in input_text:
+        # The composer's inner_text re-renders blank lines (a paragraph break
+        # comes back as extra empty lines), so a raw substring check fails on
+        # any multi-paragraph post even when every character landed. Compare
+        # with blank-line runs collapsed — still a real content check.
+        def _norm(s):
+            return "\n".join(
+                line.strip() for line in s.replace("\r", "").split("\n") if line.strip()
+            )
+
+        if _norm(text) not in _norm(input_text):
+            if os.environ.get("FB_DEBUG_TYPING"):
+                import difflib
+                print(f"[debug] expected {len(text)} chars, box has {len(input_text)}", file=sys.stderr)
+                for line in difflib.unified_diff(
+                    text.splitlines(), input_text.splitlines(),
+                    fromfile="expected", tofile="box", lineterm="", n=1
+                ):
+                    print("[debug] " + line, file=sys.stderr)
             print("FAILED: post text not confirmed in composer box. Aborting.", file=sys.stderr)
             sys.exit(1)
 
