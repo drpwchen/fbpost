@@ -911,6 +911,76 @@ async def _extract_e2ee_from_main(page, count: int) -> list[str]:
     return messages[-count:] if count else messages
 
 
+async def _count_loaded(page, is_e2ee: bool) -> int:
+    """How many messages are currently rendered in the thread pane."""
+    if is_e2ee:
+        return len(await _extract_e2ee_from_main(page, 0))
+    return await page.locator('div[role="main"] div[role="row"]').count()
+
+
+async def _scroll_message_history(
+    page, target: int, is_e2ee: bool, max_scrolls: int = 80
+) -> int:
+    """Scroll the thread pane upward until `target` messages are loaded.
+
+    `fb read --count N` used to only truncate whatever FB had already rendered
+    (~15 messages), so any N above that silently returned the same short tail.
+    Messenger lazy-loads older messages when the message pane is scrolled to
+    the top, so walk it up until the loaded count stops growing.
+
+    Returns the final loaded count. Stops early on three consecutive rounds
+    with no new messages — for E2EE threads that is the genuine end of the
+    locally decryptable history, not a transient stall.
+    """
+    loaded = await _count_loaded(page, is_e2ee)
+    stagnant = 0
+
+    for i in range(max_scrolls):
+        if loaded >= target:
+            break
+
+        # Pick the tallest scrollable container inside the thread pane: FB nests
+        # several, and the short ones are the composer / reaction popovers.
+        await page.evaluate(
+            """() => {
+                const main = document.querySelector('div[role=main]');
+                if (!main) return;
+                let best = null;
+                for (const el of main.querySelectorAll('*')) {
+                    if (el.scrollHeight > el.clientHeight + 50 && el.clientHeight > 200) {
+                        if (!best || el.clientHeight > best.clientHeight) best = el;
+                    }
+                }
+                if (best) best.scrollTop = 0;
+            }"""
+        )
+        await page.wait_for_timeout(2500)
+
+        now = await _count_loaded(page, is_e2ee)
+        if now > loaded:
+            loaded = now
+            stagnant = 0
+        else:
+            # A stalled round is usually FB still fetching, not the end of the
+            # thread — nudge with keyboard paging before giving up.
+            stagnant += 1
+            try:
+                await page.keyboard.press("PageUp")
+            except Exception:
+                pass
+            await page.wait_for_timeout(1500)
+            if await _count_loaded(page, is_e2ee) > loaded:
+                loaded = await _count_loaded(page, is_e2ee)
+                stagnant = 0
+            elif stagnant >= 6:
+                break
+
+        if i % 10 == 9:
+            print(f"  Scrolled {i + 1} times, {loaded} messages loaded...")
+
+    return loaded
+
+
 async def _extract_messages(page, count: int) -> list[str]:
     """Extract messages from the current Messenger thread view."""
     # Messages are in role="row" elements within the message list
@@ -971,7 +1041,8 @@ async def read_thread(
         # E2EE bubbles aren't role=row — parse the main panel's a11y labels,
         # which also carry sender + timestamp. Fall back to rows if empty.
         messages = []
-        if "/e2ee/" in page.url:
+        is_e2ee = "/e2ee/" in page.url
+        if is_e2ee:
             # After a PIN restore the recent (post-secure-storage) messages take
             # a few seconds to decrypt into the DOM — poll until the count is
             # stable so we don't grab only the stale pre-restore block.
@@ -982,6 +1053,15 @@ async def read_thread(
                     break
                 prev = len(cur)
                 await page.wait_for_timeout(1500)
+
+        loaded = await _scroll_message_history(page, count, is_e2ee)
+        if loaded < count:
+            print(
+                f"  Only {loaded} messages are retrievable "
+                f"(asked for {count}) — reached the start of loadable history."
+            )
+
+        if is_e2ee:
             messages = await _extract_e2ee_from_main(page, count)
         if not messages:
             messages = await _extract_messages(page, count)
