@@ -1,7 +1,9 @@
 # Changelog
 
-All notable changes to this fork are documented here.
-Upstream: [htlin222/fbpost](https://github.com/htlin222/fbpost).
+All notable changes are documented here.
+Originally forked from [htlin222/fbpost](https://github.com/htlin222/fbpost);
+maintained standalone since 2026-07-30 (upstream inactive since March 2026,
+PRs #1/#2 closed unmerged). MIT license and original copyright retained.
 
 ## [0.4.0] - 2026-07-30
 

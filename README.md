@@ -5,7 +5,7 @@
 
 Facebook CLI tool — post, comments, replies, and Messenger automation via GraphQL API + Playwright.
 
-> **This is a maintained fork of [htlin222/fbpost](https://github.com/htlin222/fbpost)** (all credit for the original design to [@htlin222](https://github.com/htlin222)). This fork adds:
+> **Originally forked from [htlin222/fbpost](https://github.com/htlin222/fbpost)** — all credit for the original design and the GraphQL groundwork goes to [@htlin222](https://github.com/htlin222), and this project stays MIT-licensed with their copyright intact. It is now maintained here as a standalone project, because upstream has been inactive since March 2026. On top of the original it adds:
 >
 > - `fb post --image` (photo attachments) via the composer UI and `--schedule` (scheduled posts) via pure GraphQL
 > - `fb post --comment` / `fb comment` — pre-write a top-level comment on a post, including scheduled posts before they publish ("link in comments")
@@ -13,8 +13,10 @@ Facebook CLI tool — post, comments, replies, and Messenger automation via Grap
 > - `fb report` — create and download a Professional Dashboard content data report (CSV) in one command, plus `scripts/report_to_md.py` to turn it into a markdown tracking table
 > - A reliability sweep: daemon-safe teardown everywhere, cookie-based login verification, honest post-send verification (several code paths used to report success without checking), wrong-contact guards in `fb search`, Windows support fixes, and event-driven waits that cut 3-12s of fixed sleeps per command
 >
-> The reliability fixes and composer features are also submitted upstream as
-> [PR #1](https://github.com/htlin222/fbpost/pull/1) and [PR #2](https://github.com/htlin222/fbpost/pull/2).
+> The reliability fixes and composer features were offered upstream as
+> [PR #1](https://github.com/htlin222/fbpost/pull/1) and
+> [PR #2](https://github.com/htlin222/fbpost/pull/2); they were closed unmerged
+> in July 2026. Anyone is welcome to take them from here.
 
 ## Setup
 
