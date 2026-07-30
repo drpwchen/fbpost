@@ -9,7 +9,7 @@ Facebook CLI tool — post, comments, replies, and Messenger automation via Grap
 >
 > - `fb post --image` (photo attachments) via the composer UI and `--schedule` (scheduled posts) via pure GraphQL
 > - `fb post --comment` / `fb comment` — pre-write a top-level comment on a post, including scheduled posts before they publish ("link in comments")
-> - `fb post-list-scheduled` / `fb post-delete-scheduled` — manage scheduled posts from the CLI
+> - `fb post-list-scheduled` / `fb comment-scheduled` / `fb post-delete-scheduled` — manage scheduled posts from the CLI, including commenting on one before it publishes
 > - `fb report` — create and download a Professional Dashboard content data report (CSV) in one command, plus `scripts/report_to_md.py` to turn it into a markdown tracking table
 > - A reliability sweep: daemon-safe teardown everywhere, cookie-based login verification, honest post-send verification (several code paths used to report success without checking), wrong-contact guards in `fb search`, Windows support fixes, and event-driven waits that cut 3-12s of fixed sleeps per command
 >
@@ -94,7 +94,12 @@ uv run fb post "Later post" --privacy EVERYONE --schedule "2026-07-18 11:00"
 The schedule time must be at least 10 minutes out (Facebook's minimum) and is
 your machine's local time, sent as an absolute epoch — no account-timezone
 ambiguity. Only `--image` still routes through the browser composer (photo
-upload has no GraphQL fast path), where the time is typed into the zh-TW UI.
+upload has no GraphQL fast path), where the schedule goes into the zh-TW UI:
+the time is typed and read back, the date is chosen from the calendar popup
+(writing into that field changes only what you see, not what Facebook stores),
+and both are re-checked against the Content Library afterwards. Facebook's own
+picker only allows roughly 30 days ahead — asking for a later date fails
+loudly instead of quietly publishing on the wrong day.
 
 Pre-write a comment on the new post in the same command — handy for the
 "link in comments" habit; it works on scheduled posts before they publish:
@@ -104,6 +109,12 @@ uv run fb post "Post text" --privacy EVERYONE \
   --schedule "2026-07-18 11:00" --comment "https://example.com/article"
 ```
 
+This now works with `--image` too, as long as the post is scheduled: a photo
+post goes through the browser composer, which returns no post_id, so the id is
+read back from the Content Library preview before the comment is sent. (An
+*immediate* photo post still can't be commented on in one command — publish
+first, then `fb comment <post_id>`.)
+
 Or comment on any of your own posts later (numeric post_id printed by
 `fb post`, or the base64 story ID):
 
@@ -111,7 +122,7 @@ Or comment on any of your own posts later (numeric post_id printed by
 uv run fb comment 1234567890123456 "https://example.com/article"
 ```
 
-### Scheduled posts — List / Delete
+### Scheduled posts — List / Comment / Delete
 
 Scheduled posts live in the Professional Dashboard's Content Library
 (**Content → Scheduled** tab); for a personal profile with no Page, Meta
@@ -119,19 +130,30 @@ Business Suite is unavailable, so these commands drive that tab.
 
 ```bash
 uv run fb post-list-scheduled              # list scheduled posts with a 1-based index
+uv run fb post-list-scheduled --ids        # ...and resolve each post_id (~10s per post)
+uv run fb comment-scheduled 2 "https://example.com/article"     # comment on a post that hasn't published yet
+uv run fb comment-scheduled 2 "text" --match "draft about cats" # abort if row 2 doesn't contain this text
 uv run fb post-delete-scheduled 2          # delete the post shown at index 2
 uv run fb post-delete-scheduled 2 --match "draft about cats"   # abort if row 2 doesn't contain this text
 ```
 
-Both commands scroll until the lazy-loaded table stops growing, so the index
-covers ALL scheduled posts. `post-delete-scheduled` resolves the index freshly
-in its own session, prints exactly what it is about to delete, aborts if
-`--match` text isn't in that row, and re-verifies the scheduled count actually
-dropped before reporting success.
+All three scroll until the lazy-loaded table stops growing (and wait for the
+row count to hold still, since Facebook briefly mounts empty skeleton rows), so
+the index covers ALL scheduled posts and never points at a placeholder.
+`post-delete-scheduled` resolves the index freshly in its own session, prints
+exactly what it is about to delete, aborts if `--match` text isn't in that row,
+and re-verifies the scheduled count actually dropped before reporting success.
 
-Like the other read-only commands, `post-list-scheduled` is headless by
-default (`--no-headless` to watch). Deletion is destructive, so
-`post-delete-scheduled` is headed by default (`--headless` to hide).
+`comment-scheduled` is the browser half of `fb comment`: a scheduled post's
+row carries no id, so it opens that row's post preview — the same dialog the
+Content Library gives you for commenting by hand — and reads the post_id out
+of the response that renders it, then comments over the normal GraphQL path.
+The comment is waiting under the post the moment it publishes.
+
+Like the other read-only commands, `post-list-scheduled` and
+`comment-scheduled` are headless by default (`--no-headless` to watch).
+Deletion is destructive, so `post-delete-scheduled` is headed by default
+(`--headless` to hide).
 
 ### Content data report (post analytics export)
 
@@ -308,7 +330,7 @@ profiles/
 
 ## Notes
 
-- **The browser-driven flows (`--image` posts, scheduled-post list/delete, `fb report`) target Facebook's Traditional Chinese (zh-TW) UI** — their selectors are zh-TW labels. If your Facebook display language isn't 繁體中文, those flows will fail at the first zh-TW-labeled step. `fb post` (including `--schedule` and `--comment`), `fb comment`, `fb comments`, and `fb reply` are pure GraphQL and language-independent.
+- **The browser-driven flows (`--image` posts, scheduled-post list/comment/delete, `fb report`) target Facebook's Traditional Chinese (zh-TW) UI** — their selectors are zh-TW labels. If your Facebook display language isn't 繁體中文, those flows will fail at the first zh-TW-labeled step. `fb post` (including `--schedule` and `--comment`), `fb comment`, `fb comments`, and `fb reply` are pure GraphQL and language-independent.
 - GraphQL doc IDs in `fb_config.py` may change when Facebook deploys new frontend code. Update them when requests start returning errors.
 - E2E threads use the URL path `/messages/e2ee/t/<id>/` automatically for numeric thread IDs > 15 digits.
 - Send defaults to headed mode. Use `--headless` only after verifying your E2E PIN session is active.

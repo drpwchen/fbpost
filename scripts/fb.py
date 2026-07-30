@@ -137,17 +137,43 @@ def _create_comment(session, tokens, actor_id, post_id: str, text: str):
         sys.exit(1)
 
 
+def _warn_if_schedule_drifted(when: str, requested: str):
+    """Compare the Content Library's own schedule line with what we asked for.
+
+    The composer can only see the fields it typed into; this is the first look
+    at what Facebook actually stored."""
+    from scripts.fb_browser import parse_when
+    actual = parse_when(when)
+    if not actual:
+        return
+    try:
+        wanted = datetime.strptime(requested, "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return
+    if abs((actual - wanted).total_seconds()) > 60:
+        print(
+            f"WARNING: scheduled for {actual:%Y-%m-%d %H:%M}, but you asked for "
+            f"{wanted:%Y-%m-%d %H:%M}. Facebook did not keep the requested time — "
+            "delete it with 'fb post-delete-scheduled' and reschedule.",
+            file=sys.stderr,
+        )
+
+
 def cmd_post(args):
     """Post text to Facebook."""
     if args.image:
         # Photo upload isn't supported by the raw GraphQL mutation below —
         # drive the real composer UI instead. (Scheduling IS GraphQL now:
         # unpublished_content_data on ComposerStoryCreateMutation.)
-        if args.comment:
+        if args.comment and not args.schedule:
+            # Published immediately, so there is no Content Library row to read
+            # the id off — the only route left is scraping /me for the newest
+            # post, which can't tell a SELF dry run from the real thing.
             print(
-                "Error: --comment needs the GraphQL post path and can't be "
-                "combined with --image (composer posts don't return a post_id). "
-                "Post first, then use 'fb comment <post_id> \"text\"'.",
+                "Error: --comment with --image needs --schedule (the scheduled "
+                "post's id is resolvable from the Content Library). For an "
+                "immediate photo post, publish first, then "
+                "'fb comment <post_id> \"text\"'.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -159,6 +185,29 @@ def cmd_post(args):
             privacy=args.privacy,
             headless=args.headless,
         ))
+        if args.comment:
+            # The composer prints no post_id; the Content Library preview knows
+            # it. Pick our row by its own text (must match exactly one row).
+            print("\nResolving the scheduled post's id to attach the comment...")
+            from scripts.fb_browser import resolve_scheduled_post_id
+            info = asyncio.run(resolve_scheduled_post_id(
+                args.profile, contains=args.text[:60], headless=True,
+            ))
+            if not info:
+                print(
+                    "The post IS scheduled, but its id could not be resolved — "
+                    "no comment was added. Run 'fb post-list-scheduled' then "
+                    "'fb comment-scheduled <#> \"text\"'.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            print(f"  post_id: {info['post_id']} (row [{info['index']}] {info['when']})")
+            _warn_if_schedule_drifted(info["when"], args.schedule)
+            cookies = load_cookies(args.profile)
+            actor_id = cookies["actor_id"]
+            session = create_session(cookies)
+            tokens = fetch_tokens(session)
+            _create_comment(session, tokens, actor_id, info["post_id"], args.comment)
         return
 
     schedule_epoch = _parse_schedule(args.schedule) if args.schedule else None
@@ -327,7 +376,40 @@ def _fetch_comments(session, tokens, actor_id, page_id, args, cursor):
 def cmd_list_scheduled(args):
     """List scheduled posts from the Content Library (Scheduled tab)."""
     from scripts.fb_browser import list_scheduled_posts
-    asyncio.run(list_scheduled_posts(args.profile, headless=not args.no_headless))
+    asyncio.run(list_scheduled_posts(
+        args.profile, headless=not args.no_headless, with_ids=args.ids,
+    ))
+
+
+def cmd_comment_scheduled(args):
+    """Comment on a not-yet-published scheduled post, picked by list index.
+
+    Bridges the one gap left by 'fb comment': a post scheduled with --image
+    goes through the browser composer, which prints no post_id, so there was
+    nothing to attach the URL comment to. The Content Library's post preview
+    knows the id — resolve it there, then comment over the normal GraphQL path
+    (feedback:<post_id> resolves before publish)."""
+    from scripts.fb_browser import resolve_scheduled_post_id
+    info = asyncio.run(resolve_scheduled_post_id(
+        args.profile,
+        index=args.index,
+        match=args.match,
+        headless=not args.no_headless,
+    ))
+    if not info:
+        print(
+            "Could not resolve a scheduled post to comment on — nothing was posted.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"Target [{info['index']}] {info['when']} — {info['text']}")
+    print(f"  post_id: {info['post_id']}")
+    cookies = load_cookies(args.profile)
+    actor_id = cookies["actor_id"]
+    session = create_session(cookies)
+    print("Fetching tokens from Facebook...")
+    tokens = fetch_tokens(session)
+    _create_comment(session, tokens, actor_id, info["post_id"], args.text)
 
 
 def cmd_delete_scheduled(args):
@@ -777,6 +859,26 @@ def main():
         "--no-headless", action="store_true",
         help="Run in headed mode (default: headless)",
     )
+    pls_parser.add_argument(
+        "--ids", action="store_true",
+        help="Also resolve each post's numeric post_id (~10s per post)",
+    )
+
+    # comment-scheduled (adds a comment to an unpublished post -> write op)
+    pcs_parser = subparsers.add_parser(
+        "comment-scheduled",
+        help="Comment on a scheduled (not yet published) post by its 1-based index",
+    )
+    pcs_parser.add_argument("index", type=int, help="1-based index shown by post-list-scheduled")
+    pcs_parser.add_argument("text", help="Comment text (e.g. the URL you park in comments)")
+    pcs_parser.add_argument(
+        "--match",
+        help="Safety check: abort unless the target row's preview text contains this string",
+    )
+    pcs_parser.add_argument(
+        "--no-headless", action="store_true",
+        help="Run in headed mode (default: headless)",
+    )
 
     # post-delete-scheduled (destructive -> headed by default, like send/post)
     pds_parser = subparsers.add_parser(
@@ -879,6 +981,8 @@ def main():
         cmd_list_scheduled(args)
     elif args.command == "post-delete-scheduled":
         cmd_delete_scheduled(args)
+    elif args.command == "comment-scheduled":
+        cmd_comment_scheduled(args)
     elif args.command == "report":
         cmd_report(args)
     elif args.command == "comment":

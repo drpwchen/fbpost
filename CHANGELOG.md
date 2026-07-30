@@ -3,6 +3,43 @@
 All notable changes to this fork are documented here.
 Upstream: [htlin222/fbpost](https://github.com/htlin222/fbpost).
 
+## [0.4.0] - 2026-07-30
+
+### Added
+
+- `fb comment-scheduled <index> "text"` — comment on a post that hasn't
+  published yet, picked by its `post-list-scheduled` index (with the same
+  `--match` safety check as delete). A scheduled row exposes no post id, so
+  the command opens that row's post preview (the Content Library dialog you
+  would comment in by hand) and reads the post_id out of the response that
+  renders it, then comments over the existing GraphQL path.
+- `fb post --image --schedule ... --comment "text"` now works: the composer
+  returns no post_id, so the id is resolved from the Content Library row
+  matching the post's own text. Photo + "link in comments" is one command
+  again. (An immediate photo post still needs a separate `fb comment`.)
+- `fb post-list-scheduled --ids` — also print each post's numeric post_id.
+
+### Fixed
+
+- **Scheduled `--image` posts could publish on a date and time nobody asked
+  for.** The composer's schedule popup accepted values that never reached
+  Facebook: a 24-hour time like `23:30` was dropped for FB's own default
+  (now + 2h), and the date field is a combobox whose value can be written
+  without changing the picker's state — so the post kept the default date
+  while every read-back looked correct. The time is now filled, read back and
+  retried in 12-hour spellings; the date is chosen from the calendar; both are
+  re-checked against the Content Library afterwards, which warns if Facebook
+  stored something else. A date outside Facebook's ~30-day scheduling window
+  now fails before posting instead of silently sliding to another day.
+- Scheduled-post rows: skeleton rows Facebook mounts while re-rendering could
+  take an index (a listing showed 5 posts for 2 real ones), which
+  delete-by-index could then act on. Rows without content are dropped and the
+  row count must hold still before it is trusted; deletion re-counts through
+  the same parser instead of a raw button count, which had produced false
+  `FAILED` reports on deletions that did go through.
+- A scheduled post whose text contains 上午/下午 no longer shows an empty
+  preview (the row parser mistook the body for the schedule line).
+
 ## [0.3.0] - 2026-07-18
 
 ### Added

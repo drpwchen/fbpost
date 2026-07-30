@@ -1,8 +1,10 @@
 """Playwright browser management — cookie injection, login capture, stealth."""
 
 import asyncio
+import base64
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -525,6 +527,129 @@ _PRIVACY_LABELS = {
 }
 
 
+def _time_candidates(dt) -> list[str]:
+    """Spellings to try for the composer's time field, likeliest first."""
+    h12 = dt.hour % 12 or 12
+    ampm_zh = "上午" if dt.hour < 12 else "下午"
+    ampm_en = "AM" if dt.hour < 12 else "PM"
+    return [
+        dt.strftime("%H:%M"),
+        f"{ampm_zh}{h12}:{dt.minute:02d}",
+        f"{h12}:{dt.minute:02d} {ampm_en}",
+    ]
+
+
+def _date_candidates(dt) -> list[str]:
+    return [
+        f"{dt.year}年{dt.month}月{dt.day}日",
+        f"{dt.month}/{dt.day}/{dt.year}",
+        dt.strftime("%Y-%m-%d"),
+    ]
+
+
+def _read_time(value: str):
+    """Parse a time field back out ('23:30', '11:30 PM', '下午11:30') -> (h, m)."""
+    m = re.search(r"(\d{1,2}):(\d{2})", value or "")
+    if not m:
+        return None
+    h, minute = int(m.group(1)), int(m.group(2))
+    up = (value or "").upper()
+    if ("PM" in up or "下午" in value) and h < 12:
+        h += 12
+    if ("AM" in up or "上午" in value) and h == 12:
+        h = 0
+    return h, minute
+
+
+def _read_date(value: str):
+    """Parse a date field back out -> (y, m, d), whatever separator FB uses."""
+    nums = [int(n) for n in re.findall(r"\d+", value or "")]
+    if len(nums) < 3:
+        return None
+    if nums[0] > 31:  # y m d
+        return nums[0], nums[1], nums[2]
+    return nums[2], nums[0], nums[1]  # m d y
+
+
+async def _fill_verified(page, field, candidates, reader, expected, label) -> bool:
+    """Fill `field` until reading it back yields `expected`.
+
+    Facebook's schedule fields accept a keystroke stream and silently keep
+    their own default when the format doesn't parse — so a blind fill can
+    schedule a post for a time nobody asked for. Nothing has been submitted
+    at this point, so failing here is safe.
+    """
+    seen = []
+    for candidate in candidates:
+        try:
+            await field.fill(candidate, timeout=5000)
+        except Exception:
+            continue
+        await page.wait_for_timeout(600)
+        try:
+            got = (await field.input_value()).strip()
+        except Exception:
+            got = ""
+        seen.append(f"{candidate!r}->{got!r}")
+        if reader(got) == expected:
+            return True
+    print(
+        f"FAILED setting the schedule {label}: Facebook did not accept it "
+        f"(tried {'; '.join(seen) or 'nothing'}). Nothing was posted.",
+        file=sys.stderr,
+    )
+    return False
+
+
+async def _pick_schedule_date(page, date_field, dt) -> bool:
+    """Choose the schedule date from the composer's calendar popup.
+
+    The date field is a combobox, not a text box: writing into it updates the
+    DOM value (so every read-back looks right) while the picker keeps its own
+    state, and the post publishes on the DEFAULT date. Clicking the day cell is
+    the only thing that commits. Cells are named by their full date
+    ("2026年8月29日 星期六"), so matching is unambiguous even for the
+    neighbouring-month days a month view spills over.
+    """
+    target = f"{dt.year}年{dt.month}月{dt.day}日"
+    await date_field.click(timeout=5000)
+    await page.wait_for_timeout(1200)
+    grid = page.get_by_role("grid").first
+    try:
+        await grid.wait_for(state="visible", timeout=8000)
+    except Exception:
+        print("FAILED: the schedule date picker did not open.", file=sys.stderr)
+        return False
+    for _ in range(24):  # ~2 years of 下個月 clicks
+        cell = grid.get_by_role("gridcell").filter(has_text=re.compile(re.escape(target)))
+        if await cell.count():
+            if await cell.first.get_attribute("aria-disabled") == "true":
+                print(
+                    f"FAILED: {target} is greyed out in the date picker — "
+                    "Facebook only schedules about 30 days ahead (and at least "
+                    "10 minutes from now). Nothing was posted.",
+                    file=sys.stderr,
+                )
+                return False
+            await cell.first.click(timeout=5000)
+            await page.wait_for_timeout(1200)
+            got = _read_date((await date_field.input_value()).strip())
+            if got == (dt.year, dt.month, dt.day):
+                return True
+            print(
+                f"FAILED: picked {target} but the date field reads {got}.",
+                file=sys.stderr,
+            )
+            return False
+        try:
+            await page.get_by_role("button", name="下個月").first.click(timeout=5000)
+        except Exception:
+            break
+        await page.wait_for_timeout(900)
+    print(f"FAILED: could not reach {target} in the date picker.", file=sys.stderr)
+    return False
+
+
 async def post_via_composer(
     profile: str,
     text: str,
@@ -688,10 +813,37 @@ async def post_via_composer(
             )
             step = "filling the schedule date/time"
             schedule_inputs = schedule_container.locator("input")
-            await schedule_inputs.nth(0).fill(date_str, timeout=5000)
-            await page.wait_for_timeout(500)
-            await schedule_inputs.nth(1).fill(time_str, timeout=5000)
-            await page.wait_for_timeout(500)
+            want_date = (dt.year, dt.month, dt.day)
+            want_time = (dt.hour, dt.minute)
+            # The time field is a plain text box — fill it, then read it back
+            # (a 24-hour "23:30" can be rejected outright, leaving FB's default
+            # of now+2h behind a success message). The date needs the calendar.
+            settled = False
+            for _ in range(3):
+                if not await _fill_verified(
+                    page, schedule_inputs.nth(1), _time_candidates(dt),
+                    _read_time, want_time, "time",
+                ):
+                    sys.exit(1)
+                if not await _pick_schedule_date(page, schedule_inputs.nth(0), dt):
+                    sys.exit(1)
+                got_date = _read_date((await schedule_inputs.nth(0).input_value()).strip())
+                got_time = _read_time((await schedule_inputs.nth(1).input_value()).strip())
+                if got_date == want_date and got_time == want_time:
+                    settled = True
+                    break
+                print(
+                    f"  schedule fields drifted after filling (date={got_date}, "
+                    f"time={got_time}) — refilling",
+                    file=sys.stderr,
+                )
+            if not settled:
+                print(
+                    "FAILED: could not get Facebook to hold both the schedule "
+                    "date and time. Nothing was posted.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
             # Popup confirm button. Try plausible confirm labels first, then
             # the historical "排定稍後通話" aria-label, then fall back to the
@@ -782,6 +934,7 @@ CONTENT_LIBRARY_URL = (
 _SCHEDULED_TAB = "已排定發佈"
 _ROW_ACTION_LABEL = "可對此貼文採取的動作"
 _DELETE_MENUITEM = "刪除貼文"
+_VIEW_POST_BUTTON = "查看貼文頁面的連結"
 
 
 async def _open_scheduled_tab(page):
@@ -838,6 +991,15 @@ async def _scheduled_rows(page):
             break
         await page.wait_for_timeout(1000)
         n = await actions.count()
+    # While re-rendering, FB briefly mounts skeleton rows that already carry an
+    # actions button but no content. Require the count to hold still before
+    # trusting it, or indexes shift under us between listing and deleting.
+    for _ in range(6):
+        await page.wait_for_timeout(1000)
+        again = await actions.count()
+        if again == n:
+            break
+        n = again
     rows = []
     for i in range(n):
         text, when = "", ""
@@ -847,34 +1009,229 @@ async def _scheduled_rows(page):
             row = actions.nth(i).locator("xpath=ancestor::*[@role='row'][1]")
             raw = (await row.inner_text()).replace("\xa0", " ")
             lines = [l.strip() for l in raw.splitlines() if l.strip() and l.strip() != "預覽"]
-            # schedule info spans "已排定 •" and a time line like "明天上午11:00"
-            sched_kw = ("已排定", "上午", "下午")
-            when = " ".join(l for l in lines if any(k in l for k in sched_kw))
+            # Schedule info reads "已排定 • 明天上午11:00". Anchor on 已排定
+            # ONLY — an earlier version also treated any line containing
+            # 上午/下午 as schedule info, which swallowed post bodies that
+            # happen to say e.g. "上午和下午" and left `text` empty.
+            # (the label and the time are two separate lines: "已排定 •" then
+            # "明天上午7:00" — a time line is short and matches 上午/下午HH:MM)
+            sched = [
+                l for l in lines
+                if "已排定" in l
+                or (len(l) <= 30 and re.search(r"(上午|下午)\s*\d{1,2}:\d{2}", l))
+            ]
+            when = " ".join(sched)
             # FB renders the preview text twice; take the first non-schedule line
-            text_lines = [l for l in lines if not any(k in l for k in sched_kw)]
+            text_lines = [l for l in lines if l not in sched]
             text = text_lines[0] if text_lines else ""
         except Exception:
             pass
-        rows.append({"index": i, "text": text[:100], "when": when})
+        if not text and not when:
+            continue  # skeleton/placeholder row — never let it take an index
+        # "n" is the 1-based number users see and pass back on the command
+        # line; "index" is where the row's button sits in the locator list.
+        rows.append({"n": len(rows) + 1, "index": i, "text": text[:100], "when": when})
     return actions, rows
 
 
-async def list_scheduled_posts(profile: str, headless: bool = True):
-    """Print all scheduled posts (1-based index, time, preview)."""
+async def _row_post_id(page, actions, index: int, wait_ms: int = 20000):
+    """Return the numeric post_id of the scheduled row at 0-based `index`.
+
+    The row markup itself carries only CDN image ids, so we open the row's
+    post-preview dialog — the 查看貼文頁面的連結 button, i.e. the same dialog
+    where you can comment on an unpublished post by hand — and read the id out
+    of the GraphQL response that renders it. Returns (post_id | None, ids_seen);
+    a set of more than one distinct id means "don't guess" and yields None.
+    """
+    found: list[str] = []
+    pending: list = []
+
+    async def _scan(resp):
+        if "/api/graphql" not in resp.url:
+            return
+        try:
+            body = await resp.text()
+        except Exception:
+            return
+        for m in re.finditer(r'"post_id":"(\d+)"', body):
+            found.append(m.group(1))
+        # top-level feedback ids: base64("feedback:<post_id>"). The comment-level
+        # ones look like "feedback:<post_id>_<comment_id>" and are skipped.
+        for m in re.finditer(r'"id":"(ZmVlZGJhY2s[A-Za-z0-9=_-]+)"', body):
+            try:
+                dec = base64.b64decode(m.group(1) + "==").decode("utf-8")
+            except Exception:
+                continue
+            if dec.startswith("feedback:") and dec[len("feedback:"):].isdigit():
+                found.append(dec[len("feedback:"):])
+
+    def _handler(resp):
+        pending.append(asyncio.create_task(_scan(resp)))
+
+    page.on("response", _handler)
+    try:
+        row = actions.nth(index).locator("xpath=ancestor::*[@role='row'][1]")
+        btn = row.get_by_role("button", name=_VIEW_POST_BUTTON)
+        if not await btn.count():
+            print(
+                f"Could not find the '{_VIEW_POST_BUTTON}' button on row "
+                f"[{index + 1}] — cannot resolve its post_id.",
+                file=sys.stderr,
+            )
+            return None, []
+        await btn.first.click(timeout=8000)
+        for _ in range(max(1, wait_ms // 500)):
+            if found:
+                break
+            await page.wait_for_timeout(500)
+        await page.wait_for_timeout(1500)  # let sibling responses land too
+    finally:
+        page.remove_listener("response", _handler)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        try:  # close the preview so the caller can keep driving the list
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(800)
+        except Exception:
+            pass
+
+    ids = sorted(set(found))
+    if len(ids) == 1:
+        return ids[0], ids
+    if not ids:
+        print(
+            f"No post_id appeared in the preview of row [{index + 1}].",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Ambiguous: row [{index + 1}]'s preview exposed several post ids "
+            f"({', '.join(ids)}) — refusing to guess.",
+            file=sys.stderr,
+        )
+    return None, ids
+
+
+async def list_scheduled_posts(profile: str, headless: bool = True, with_ids: bool = False):
+    """Print all scheduled posts (1-based index, time, preview[, post_id])."""
     p, browser, context = await create_browser_context(profile, headless, persistent=False)
     page = None
     try:
         page = await context.new_page()
         await _open_scheduled_tab(page)
-        _, rows = await _scheduled_rows(page)
+        actions, rows = await _scheduled_rows(page)
         if not rows:
             print("No scheduled posts.")
             return
         print(f"Scheduled posts ({len(rows)}):")
         print("-" * 72)
+        if with_ids:
+            print("(resolving post ids — ~10s per post)")
         for r in rows:
-            print(f"[{r['index'] + 1}] {r['when']}")
+            print(f"[{r['n']}] {r['when']}")
             print(f"    {r['text']}")
+            if with_ids:
+                pid, _ = await _row_post_id(page, actions, r["index"])
+                print(f"    post_id: {pid or 'UNRESOLVED'}")
+    finally:
+        await _teardown(p, browser, context, page)
+
+
+def parse_when(when: str, now: datetime = None):
+    """Turn a row's "已排定 • 明天下午9:45" into a datetime, or None.
+
+    Used to check after the fact that a post really landed on the time that
+    was asked for — the composer's schedule fields have silently reverted
+    before, and the composer itself cannot see the result.
+    """
+    if not when:
+        return None
+    now = now or datetime.now()
+    t = _read_time(when)
+    if not t:
+        return None
+    md = re.search(r"(\d{1,2})月(\d{1,2})日", when)
+    if md:
+        month, day = int(md.group(1)), int(md.group(2))
+        year = now.year + 1 if (month, day) < (now.month, now.day) else now.year
+        date = datetime(year, month, day)
+    elif "明天" in when:
+        date = now + timedelta(days=1)
+    elif "今天" in when:
+        date = now
+    else:
+        return None
+    return date.replace(hour=t[0], minute=t[1], second=0, microsecond=0)
+
+
+def _norm_preview(s: str) -> str:
+    """Collapse whitespace so post text and row preview text compare sanely."""
+    return re.sub(r"\s+", "", s or "")
+
+
+async def resolve_scheduled_post_id(
+    profile: str,
+    index: int = None,
+    match: str = None,
+    contains: str = None,
+    headless: bool = True,
+):
+    """Resolve one scheduled post to its numeric post_id.
+
+    Pick the row either by 1-based `index` (as shown by post-list-scheduled) or
+    by `contains` — a text fragment that must match EXACTLY ONE row. `match` is
+    the same safety check delete uses: the chosen row's preview must contain it.
+    Returns {"index", "when", "text", "post_id"} or None (reason on stderr).
+    """
+    p, browser, context = await create_browser_context(profile, headless, persistent=False)
+    page = None
+    try:
+        page = await context.new_page()
+        await _open_scheduled_tab(page)
+        actions, rows = await _scheduled_rows(page)
+        if not rows:
+            print("No scheduled posts.", file=sys.stderr)
+            return None
+
+        if index is None:
+            needle = _norm_preview(contains)
+            hits = [r for r in rows if needle and needle in _norm_preview(r["text"])]
+            if len(hits) != 1:
+                print(
+                    f"Cannot pick a row by text: {len(hits)} of {len(rows)} scheduled "
+                    f"posts match {(contains or '')[:40]!r}. Run post-list-scheduled "
+                    "and use the index instead.",
+                    file=sys.stderr,
+                )
+                return None
+            target = hits[0]
+        else:
+            if index < 1 or index > len(rows):
+                print(
+                    f"Error: index {index} out of range (1..{len(rows)}).",
+                    file=sys.stderr,
+                )
+                return None
+            target = rows[index - 1]
+
+        if match and match not in target["text"] and match not in target["when"]:
+            print(
+                f"ABORTED: row [{target['n']}] does not match --match {match!r}.\n"
+                f"  Found instead: {target['when']} — {target['text']}\n"
+                "  The list may have changed; re-run post-list-scheduled.",
+                file=sys.stderr,
+            )
+            return None
+
+        post_id, _ = await _row_post_id(page, actions, target["index"])
+        if not post_id:
+            return None
+        return {
+            "index": target["n"],
+            "when": target["when"],
+            "text": target["text"],
+            "post_id": post_id,
+        }
     finally:
         await _teardown(p, browser, context, page)
 
@@ -907,7 +1264,7 @@ async def delete_scheduled_post(profile: str, index: int, headless: bool = False
             sys.exit(1)
         print(f"Deleting [{index}] {target['when']} — {target['text']}")
 
-        await actions.nth(index - 1).click(timeout=6000)
+        await actions.nth(target["index"]).click(timeout=6000)
         await page.wait_for_timeout(1500)
         await page.get_by_role("menuitem", name=_DELETE_MENUITEM).first.click(timeout=6000)
         await page.wait_for_timeout(1500)
@@ -925,8 +1282,11 @@ async def delete_scheduled_post(profile: str, index: int, headless: bool = False
         await page.wait_for_timeout(4000)
 
         # POST verification: the row count must drop, or we report failure
-        # rather than falsely claiming success.
-        after = await page.get_by_role("button", name=_ROW_ACTION_LABEL).count()
+        # rather than falsely claiming success. Re-scan through the same row
+        # parser as `before` — a raw button count also sees skeleton rows and
+        # has reported a false FAILED on a deletion that did go through.
+        _, after_rows = await _scheduled_rows(page)
+        after = len(after_rows)
         if after < before:
             print(f"Deleted. Scheduled posts: {before} -> {after}")
         else:
