@@ -17,6 +17,16 @@ REPLY_DOC_ID = "26136887842641090"
 # CometFocusedStoryViewStoryQuery — fetch full post/story content
 STORY_VIEW_DOC_ID = "25859627517041679"
 
+# CometPrivacySelectorPickerContainerQuery — the composer's audience list.
+# Used to resolve audiences that are not a plain base_state (subscribers,
+# close friends): those are base_state SELF plus an account-specific list id
+# in `allow`, which has to be read off this query rather than hardcoded.
+PRIVACY_SELECTOR_DOC_ID = "27910248861900432"
+
+# base64('privacy_scope_renderer:{"id":8787670733}') — the timeline composer's
+# privacy scope, taken verbatim from the web client's own request.
+PRIVACY_WRITE_ID = "cHJpdmFjeV9zY29wZV9yZW5kZXJlcjp7ImlkIjo4Nzg3NjcwNzMzfQ"
+
 # Browser identity used for BOTH Playwright contexts and raw HTTP requests —
 # keep the Chrome major version in sync with the Sec-Ch-Ua headers in
 # fb_session.py when bumping it.

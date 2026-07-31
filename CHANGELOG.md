@@ -5,6 +5,41 @@ Originally forked from [htlin222/fbpost](https://github.com/htlin222/fbpost);
 maintained standalone since 2026-07-30 (upstream inactive since March 2026,
 PRs #1/#2 closed unmerged). MIT license and original copyright retained.
 
+## [0.5.0] - 2026-07-31
+
+### Added
+
+- `fb post --privacy SUBSCRIBERS` — post to the profile's subscriber-only
+  audience, on both the GraphQL path and the browser composer path
+  (`--image`). Facebook does not expose this as a privacy state: it is
+  `base_state: SELF` plus an account-specific subscriber list id in `allow`.
+  The id is resolved at post time from the account's own audience list
+  (`CometPrivacySelectorPickerContainerQuery`), keyed on the stable
+  `supporter_exclusive` icon rather than a localized label, so nothing is
+  hardcoded and another account's id can never leak in. A profile without
+  subscriptions gets a clear refusal instead of a post to a wider audience.
+- The audience of a post created through the GraphQL path is now read back
+  from Facebook and reported (`Audience confirmed by Facebook: 僅限訂閱者`)
+  whenever a list-backed audience was requested — "the mutation returned a
+  post id" does not prove the allow list survived, and a dropped list id
+  would silently reduce a subscriber post to only-me.
+
+### Fixed
+
+- The composer path could post to the wrong audience. Selecting the audience
+  clicked the option and pressed 完成 after a fixed 500 ms, without ever
+  checking that the selection took — with a photo attached it frequently did
+  not, leaving the previous audience (usually 所有人) in place. The option's
+  radio must now read `aria-checked=true`, and after the dialog closes the
+  composer's own audience label is compared against what was asked for;
+  either check failing aborts before the post is submitted.
+- The audience dialog was located as "the last open dialog", which picked up
+  whatever else Facebook had opened on top (e.g. its "photo could not be
+  read" error) and then failed with a confusing message. It is now found by
+  its heading.
+- An unrecognized `--privacy` value fell back to 所有人 (public) in the
+  composer path — the worst possible default. It now fails.
+
 ## [0.4.0] - 2026-07-30
 
 ### Added

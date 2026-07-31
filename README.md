@@ -85,7 +85,23 @@ uv run fb post "Hello world" --privacy FRIENDS
 uv run fb --profile fanpage post "Hello from page" --privacy EVERYONE
 ```
 
-Options: `--privacy SELF|FRIENDS|EVERYONE` (default: `SELF`)
+Options: `--privacy SELF|FRIENDS|EVERYONE|SUBSCRIBERS` (default: `SELF`)
+
+`SUBSCRIBERS` is the profile's subscriber-only audience (「訂閱者 / 僅限此個人
+檔案的訂閱者」), available on profiles with Facebook subscriptions turned on.
+Facebook does not model it as a privacy state: it is `base_state: SELF` plus a
+per-account subscriber list id, so the id is looked up from your own audience
+list at post time (matched on the stable `supporter_exclusive` icon, not on a
+localized label) and never hardcoded. If that option is missing from the
+account, the post is refused rather than sent to a wider audience. On the
+GraphQL path the audience is also read back off the created post and printed
+(`Audience confirmed by Facebook: 僅限訂閱者`); on the composer path
+(`--image`) the picker's radio must actually flip and the composer must show
+the audience before anything is submitted.
+
+Note that a subscriber post can't be rehearsed with `--privacy SELF` — the
+audiences are different objects. Verify a real one from a logged-out browser
+(it should not render) or from a non-subscriber account.
 
 Schedule for later (pure GraphQL — no browser, no zh-TW selector dependency):
 

@@ -1,6 +1,6 @@
 [project]
 name = "fbpost"
-version = "0.4.0"
+version = "0.5.0"
 description = "Facebook CLI tool — post, list comments, reply to comments"
 readme = "README.md"
 requires-python = ">=3.12"

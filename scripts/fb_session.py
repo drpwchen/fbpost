@@ -8,7 +8,12 @@ import sys
 import requests
 from dotenv import dotenv_values
 
-from scripts.fb_config import FB_USER_AGENT, STORY_VIEW_DOC_ID
+from scripts.fb_config import (
+    FB_USER_AGENT,
+    PRIVACY_SELECTOR_DOC_ID,
+    PRIVACY_WRITE_ID,
+    STORY_VIEW_DOC_ID,
+)
 
 
 GRAPHQL_URL = "https://www.facebook.com/api/graphql/"
@@ -379,3 +384,176 @@ def fetch_story_text(session, tokens, actor_id, story_id):
     _get_attached_text(node)
 
     return texts
+
+
+# ── Audience / privacy ───────────────────────────────────────────────────────
+
+# Audiences that are NOT a plain base_state. Facebook models them as
+# base_state SELF plus an account-specific list id in `allow` — the id differs
+# per account (and would silently post to the wrong people if hardcoded), so it
+# is resolved at runtime. The icon name is the stable key; labels are localized.
+PRIVACY_ICON_BY_NAME = {
+    "SUBSCRIBERS": "supporter_exclusive",
+}
+
+PLAIN_PRIVACY_STATES = ("EVERYONE", "FRIENDS", "SELF")
+
+
+def _iter_privacy_options(node):
+    """Yield every privacy option object in a privacy-selector response."""
+    if isinstance(node, dict):
+        row = node.get("privacy_row_input")
+        icon = node.get("icon_image")
+        if isinstance(row, dict) and isinstance(icon, dict) and icon.get("name"):
+            yield {"icon": icon["name"], "label": node.get("label", ""), "row": row}
+        for value in node.values():
+            yield from _iter_privacy_options(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _iter_privacy_options(value)
+
+
+def fetch_privacy_options(session, tokens, actor_id) -> list[dict]:
+    """Fetch the composer's audience list (what the 貼文分享對象 dialog shows)."""
+    variables = {
+        "localPrivacyRow": {
+            "allow": [],
+            "base_state": "EVERYONE",
+            "deny": [],
+            "tag_expansion_state": "UNSPECIFIED",
+        },
+        "privacyWriteID": PRIVACY_WRITE_ID,
+        "renderLocation": "COMET_FULLSCREEN_COMPOSER",
+        "scale": 2,
+    }
+    data = graphql_request(
+        session, tokens, actor_id, PRIVACY_SELECTOR_DOC_ID,
+        "CometPrivacySelectorPickerContainerQuery", variables,
+    )
+    options, seen = [], set()
+    for opt in _iter_privacy_options(data):
+        key = (opt["icon"], json.dumps(opt["row"], sort_keys=True))
+        if key in seen:
+            continue
+        seen.add(key)
+        options.append(opt)
+    return options
+
+
+def resolve_privacy_row(session, tokens, actor_id, privacy: str) -> dict:
+    """Return the `audience.privacy` payload for a --privacy value.
+
+    Plain states are built locally; list-backed audiences (SUBSCRIBERS) are
+    looked up in the account's own privacy selector. Exits with a clear error
+    rather than falling back to a wider audience — silently posting
+    subscriber-only content to everyone is the failure mode to avoid.
+    """
+    if privacy in PLAIN_PRIVACY_STATES:
+        return {
+            "allow": [],
+            "base_state": privacy,
+            "deny": [],
+            "tag_expansion_state": "UNSPECIFIED",
+        }
+
+    icon = PRIVACY_ICON_BY_NAME.get(privacy)
+    if not icon:
+        print(f"Error: unsupported --privacy value {privacy!r}", file=sys.stderr)
+        sys.exit(1)
+
+    options = fetch_privacy_options(session, tokens, actor_id)
+    match = next((o for o in options if o["icon"] == icon), None)
+    if not match:
+        available = ", ".join(f"{o['icon']}({o['label']})" for o in options) or "none"
+        print(
+            f"Error: this profile's audience list has no '{icon}' option, so "
+            f"--privacy {privacy} cannot be used. Subscriber-only sharing needs "
+            "Facebook subscriptions enabled on the profile. "
+            f"Available: {available}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    row = match["row"]
+    if not row.get("allow"):
+        print(
+            f"Error: the '{icon}' audience came back without a list id "
+            f"({json.dumps(row, ensure_ascii=False)}) — refusing to post, since "
+            "base_state SELF alone would make the post visible only to you.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return {
+        "allow": list(row["allow"]),
+        "base_state": row.get("base_state", "SELF"),
+        "deny": list(row.get("deny") or []),
+        "tag_expansion_state": row.get("tag_expansion_state", "UNSPECIFIED"),
+    }
+
+
+def fetch_story_privacy(session, tokens, actor_id, story_id: str) -> dict | None:
+    """Read back the audience Facebook actually stored on a story.
+
+    Returns {"icon", "label", "allow"} or None if the story's privacy scope
+    could not be read. Used to confirm a list-backed audience landed, since
+    the mutation reports success regardless of what it stored.
+    """
+    variables = {
+        "feedLocation": "DEDICATED_COMMENTING_SURFACE",
+        "feedbackSource": 110,
+        "focusCommentID": None,
+        "privacySelectorRenderLocation": "COMET_STREAM",
+        "referringStoryRenderLocation": "professional_dashboard",
+        "renderLocation": "professional_dashboard",
+        "scale": 2,
+        "useDefaultActor": False,
+        "storyID": story_id,
+        **STORY_VIEW_RELAY_PV_FLAGS,
+    }
+    try:
+        data = graphql_request(
+            session, tokens, actor_id, STORY_VIEW_DOC_ID,
+            "CometFocusedStoryViewStoryQuery", variables,
+        )
+    except SystemExit:
+        return None
+
+    def _find(node, pred):
+        if isinstance(node, dict):
+            if pred(node):
+                return node
+            for value in node.values():
+                found = _find(value, pred)
+                if found is not None:
+                    return found
+        elif isinstance(node, list):
+            for value in node:
+                found = _find(value, pred)
+                if found is not None:
+                    return found
+        return None
+
+    # The stored audience lives on the story's privacy_scope_renderer; its
+    # human label sits further down under entry_point_renderer, so the two
+    # are collected separately rather than off one node.
+    renderer = _find(
+        data,
+        lambda n: isinstance(n.get("privacy_scope_renderer"), dict)
+        and isinstance(n["privacy_scope_renderer"].get("privacy_row_input"), dict),
+    )
+    if renderer is None:
+        return None
+    renderer = renderer["privacy_scope_renderer"]
+    row = renderer["privacy_row_input"]
+    labelled = _find(
+        renderer,
+        lambda n: isinstance(n.get("icon_image"), dict)
+        and n["icon_image"].get("name")
+        and n.get("label"),
+    ) or {}
+    return {
+        "icon": (labelled.get("icon_image") or {}).get("name", ""),
+        "label": labelled.get("label", ""),
+        "allow": list(row.get("allow") or []),
+    }

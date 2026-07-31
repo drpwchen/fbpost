@@ -22,6 +22,9 @@ from scripts.fb_session import (
     load_cookies,
     fetch_page_id,
     fetch_story_text,
+    fetch_story_privacy,
+    resolve_privacy_row,
+    PLAIN_PRIVACY_STATES,
 )
 
 def _last_comments_file(profile: str = "default") -> str:
@@ -220,6 +223,12 @@ def cmd_post(args):
     tokens = fetch_tokens(session)
     print(f"  fb_dtsg: {tokens['fb_dtsg'][:20]}...")
 
+    # SUBSCRIBERS (and any other list-backed audience) is not a base_state —
+    # it needs this account's own list id, looked up before we post.
+    privacy_row = resolve_privacy_row(session, tokens, actor_id, args.privacy)
+    if args.privacy not in PLAIN_PRIVACY_STATES:
+        print(f"  audience: {args.privacy} -> {json.dumps(privacy_row)}")
+
     session_id = str(uuid.uuid4())
     variables = {
         "input": {
@@ -228,14 +237,7 @@ def cmd_post(args):
             "idempotence_token": f"{session_id}_FEED",
             "source": "WWW",
             "attachments": [],
-            "audience": {
-                "privacy": {
-                    "allow": [],
-                    "base_state": args.privacy,
-                    "deny": [],
-                    "tag_expansion_state": "UNSPECIFIED",
-                }
-            },
+            "audience": {"privacy": privacy_row},
             "message": {"ranges": [], "text": args.text},
             "with_tags_ids": None,
             "inline_activities": [],
@@ -325,6 +327,28 @@ def cmd_post(args):
                 file=sys.stderr,
             )
             sys.exit(1)
+
+    # A list-backed audience is the one case where "the mutation succeeded"
+    # is not enough: if the allow list were dropped, base_state SELF would
+    # quietly make a subscriber post visible to nobody but the author.
+    if args.privacy not in PLAIN_PRIVACY_STATES:
+        story_id = story_create.get("story_id") or (story or {}).get("id")
+        stored = fetch_story_privacy(session, tokens, actor_id, story_id) if story_id else None
+        if stored is None:
+            print(
+                "WARNING: could not read the post's audience back from Facebook "
+                f"— verify by hand that it is {args.privacy}.",
+                file=sys.stderr,
+            )
+        elif stored["allow"] != privacy_row["allow"]:
+            print(
+                f"WARNING: Facebook stored audience {stored['label']!r} "
+                f"(allow={stored['allow']}), not the requested {args.privacy} "
+                f"(allow={privacy_row['allow']}). Check the post before relying on it.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  Audience confirmed by Facebook: {stored['label']}")
 
     if args.comment and post_id:
         print()
@@ -817,8 +841,11 @@ def main():
     post_parser = subparsers.add_parser("post", help="Post text to Facebook")
     post_parser.add_argument("text", help="The text to post")
     post_parser.add_argument(
-        "--privacy", choices=["EVERYONE", "FRIENDS", "SELF"],
-        default="SELF", help="Privacy setting (default: SELF)",
+        "--privacy", choices=["EVERYONE", "FRIENDS", "SELF", "SUBSCRIBERS"],
+        default="SELF",
+        help="Audience (default: SELF). SUBSCRIBERS = subscriber-only sharing "
+        "on this profile; it cannot be dry-run as SELF, so verify a "
+        "SUBSCRIBERS post from a logged-out browser instead.",
     )
     post_parser.add_argument(
         "--image", help="Path to an image to attach (routes through the browser composer, not the GraphQL fast path)",

@@ -524,7 +524,23 @@ _PRIVACY_LABELS = {
     "EVERYONE": "所有人",
     "FRIENDS": "朋友",
     "SELF": "只限本人",
+    # subscriber-only sharing (icon supporter_exclusive); the row reads
+    # 訂閱者 / 僅限此個人檔案的訂閱者
+    "SUBSCRIBERS": "訂閱者",
 }
+
+
+def _selected_audience(dialog_text: str) -> str:
+    """Read the audience the composer currently shows, or '' if not found.
+
+    The composer renders the control as two lines: 貼文分享對象 then the
+    selected audience's label.
+    """
+    lines = [l.strip() for l in dialog_text.splitlines() if l.strip()]
+    for i, line in enumerate(lines):
+        if "貼文分享對象" in line and i + 1 < len(lines):
+            return lines[i + 1]
+    return ""
 
 
 def _time_candidates(dt) -> list[str]:
@@ -762,7 +778,16 @@ async def post_via_composer(
         # Audience/privacy — always set explicitly rather than trusting
         # whatever FB last remembered as the default.
         step = "setting the audience"
-        target_label = _PRIVACY_LABELS.get(privacy, "所有人")
+        # No default — an unknown value used to fall back to 所有人 (public),
+        # which is the worst possible guess for a mistyped audience.
+        target_label = _PRIVACY_LABELS.get(privacy)
+        if not target_label:
+            print(
+                f"Error: unsupported --privacy value {privacy!r} for the "
+                f"composer path (known: {', '.join(_PRIVACY_LABELS)}).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         audience_row = dialog.get_by_text("貼文分享對象", exact=False).first
         await audience_row.click(timeout=8000)
         # Wait for the audience modal to open (dialog count grows) instead of
@@ -772,12 +797,74 @@ async def post_via_composer(
             if await privacy_dialogs.count() > 1:
                 break
             await page.wait_for_timeout(300)
+        # Pick the dialog by its own heading, not by position: an unrelated
+        # dialog (e.g. Facebook's "photo could not be read" error) can open on
+        # top and would otherwise be mistaken for the audience picker.
         pd_count = await privacy_dialogs.count()
-        privacy_modal = privacy_dialogs.nth(pd_count - 1)
-        await privacy_modal.get_by_text(target_label, exact=True).first.click(timeout=5000)
-        await page.wait_for_timeout(500)
+        privacy_modal = None
+        for i in range(pd_count - 1, -1, -1):
+            candidate = privacy_dialogs.nth(i)
+            if await candidate.get_by_text("選擇分享對象", exact=False).count():
+                privacy_modal = candidate
+                break
+        if privacy_modal is None:
+            texts = []
+            for i in range(pd_count):
+                try:
+                    texts.append((await privacy_dialogs.nth(i).inner_text())[:120])
+                except Exception:
+                    pass
+            print(
+                "FAILED: the audience picker did not open. Open dialogs: "
+                + " | ".join(t.replace("\n", " / ") for t in texts),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        option = privacy_modal.get_by_text(target_label, exact=True)
+        if not await option.count():
+            print(
+                f"FAILED: the audience dialog has no '{target_label}' option "
+                f"(--privacy {privacy}). Aborting before posting.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        await option.first.click(timeout=5000)
+        # Wait for the row's radio to actually flip before confirming —
+        # pressing 完成 too early leaves the previous audience in place and
+        # the composer happily posts to it.
+        radio = option.first.locator(
+            "xpath=ancestor::*[.//input[@type='radio']][1]"
+        ).locator("input[type='radio']").first
+        picked = False
+        for _ in range(20):  # up to ~6s
+            try:
+                if await radio.get_attribute("aria-checked") == "true":
+                    picked = True
+                    break
+            except Exception:
+                pass
+            await page.wait_for_timeout(300)
+        if not picked:
+            print(
+                f"FAILED: '{target_label}' did not become the selected audience "
+                "in the picker. Aborting before posting.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         await privacy_modal.get_by_text("完成", exact=True).first.click(timeout=5000)
         await page.wait_for_timeout(1000)
+        # Read the audience back off the composer — the click can land on a
+        # disabled row or be undone by a re-render, and posting to the wrong
+        # audience is not recoverable by editing afterwards.
+        shown = _selected_audience(await dialog.inner_text())
+        if shown != target_label:
+            print(
+                f"FAILED: composer still shows audience {shown or '(unknown)'!r}, "
+                f"expected {target_label!r}. Aborting before posting.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"Audience set to {target_label} ({privacy}).")
 
         if schedule_at:
             try:
