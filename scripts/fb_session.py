@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import uuid
 
 import requests
 from dotenv import dotenv_values
@@ -557,3 +558,108 @@ def fetch_story_privacy(session, tokens, actor_id, story_id: str) -> dict | None
         "label": labelled.get("label", ""),
         "allow": list(row.get("allow") or []),
     }
+
+
+# ── Photo upload ─────────────────────────────────────────────────────────────
+
+# The composer's own upload endpoint. Captured 2026-08-03 by hooking
+# XMLHttpRequest.send in the page (Playwright cannot read a multipart body,
+# and the request's parameters live in the query string, not the form).
+PHOTO_UPLOAD_URL = (
+    "https://upload.facebook.com/ajax/react_composer/attachments/photo/upload"
+)
+
+_MIME_BY_EXT = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
+
+
+def upload_photo(session, tokens, actor_id, image_path: str) -> str:
+    """Upload one photo and return its photoID, for `attachments` on a post.
+
+    This is the API equivalent of dropping a file on the composer, so a photo
+    post no longer has to drive the browser. An unattached upload is invisible
+    on the profile — nothing is published until the id is used in a mutation.
+    """
+    if not os.path.isfile(image_path):
+        print(f"Error: image file not found: {image_path}", file=sys.stderr)
+        sys.exit(1)
+
+    ext = os.path.splitext(image_path)[1].lower()
+    mime = _MIME_BY_EXT.get(ext)
+    if not mime:
+        print(
+            f"Error: unsupported image type {ext!r} "
+            f"(known: {', '.join(sorted(_MIME_BY_EXT))}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    with open(image_path, "rb") as fh:
+        blob = fh.read()
+
+    params = {
+        "av": actor_id, "__aaid": "0", "__user": actor_id, "__a": "1",
+        "__comet_req": "15",
+        "fb_dtsg": tokens["fb_dtsg"],
+        "jazoest": tokens.get("jazoest", ""),
+        "lsd": tokens.get("lsd", ""),
+        "__spin_r": tokens.get("__rev", ""),
+        "__spin_b": tokens.get("__spin_b", "trunk"),
+        "__spin_t": tokens.get("__spin_t", ""),
+        "__crn": "comet.fbweb.CometPostCreateRoute",
+    }
+    # Field names as the composer sends them; source=8 marks a composer photo.
+    form = {
+        "source": "8",
+        "profile_id": actor_id,
+        "waterfallxapp": "comet",
+        "upload_id": "jsc_c_" + uuid.uuid4().hex[:8],
+    }
+    files = {"farr": (os.path.basename(image_path), blob, mime)}
+
+    # graphql_request() leaves Content-Type: application/x-www-form-urlencoded
+    # (and X-FB-Friendly-Name) on the shared session. requests only generates
+    # the multipart Content-Type with its boundary when nothing else sets one,
+    # so those leftovers make Facebook read this body as urlencoded and answer
+    # 400 — but only when a GraphQL call ran first, which is exactly what the
+    # SUBSCRIBERS path does. Drop them for this request, then restore.
+    stashed = {
+        key: session.headers.pop(key)
+        for key in ("Content-Type", "X-FB-Friendly-Name")
+        if key in session.headers
+    }
+    try:
+        resp = session.post(
+            PHOTO_UPLOAD_URL, params=params, data=form, files=files,
+            headers={
+                "Referer": "https://www.facebook.com/",
+                "Origin": "https://www.facebook.com",
+            },
+            timeout=300,
+        )
+    finally:
+        session.headers.update(stashed)
+    body = resp.text
+    if body.startswith("for (;;);"):
+        body = body[len("for (;;);"):]
+    try:
+        data = json.loads(body)
+    except ValueError:
+        print(
+            f"Error: photo upload returned an unreadable response "
+            f"(status {resp.status_code}): {body[:200]}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    photo_id = (data.get("payload") or {}).get("photoID")
+    if not photo_id:
+        reason = data.get("errorSummary") or data.get("error") or "no photoID in response"
+        print(f"Error: photo upload failed — {reason}", file=sys.stderr)
+        sys.exit(1)
+
+    size_kb = len(blob) // 1024
+    print(f"  photo uploaded: {os.path.basename(image_path)} ({size_kb} KB) -> {photo_id}")
+    return photo_id

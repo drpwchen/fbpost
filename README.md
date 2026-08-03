@@ -7,7 +7,7 @@ Facebook CLI tool — post, comments, replies, and Messenger automation via Grap
 
 > **Originally forked from [htlin222/fbpost](https://github.com/htlin222/fbpost)** — all credit for the original design and the GraphQL groundwork goes to [@htlin222](https://github.com/htlin222), and this project stays MIT-licensed with their copyright intact. It is now maintained here as a standalone project, because upstream has been inactive since March 2026. On top of the original it adds:
 >
-> - `fb post --image` (photo attachments) via the composer UI and `--schedule` (scheduled posts) via pure GraphQL
+> - `fb post --image` (photo attachments) and `--schedule` (scheduled posts), both via pure GraphQL
 > - `fb post --comment` / `fb comment` — pre-write a top-level comment on a post, including scheduled posts before they publish ("link in comments")
 > - `fb post-list-scheduled` / `fb comment-scheduled` / `fb post-delete-scheduled` — manage scheduled posts from the CLI, including commenting on one before it publishes
 > - `fb report` — create and download a Professional Dashboard content data report (CSV) in one command, plus `scripts/report_to_md.py` to turn it into a markdown tracking table
@@ -95,9 +95,9 @@ list at post time (matched on the stable `supporter_exclusive` icon, not on a
 localized label) and never hardcoded. If that option is missing from the
 account, the post is refused rather than sent to a wider audience. On the
 GraphQL path the audience is also read back off the created post and printed
-(`Audience confirmed by Facebook: 僅限訂閱者`); on the composer path
-(`--image`) the picker's radio must actually flip and the composer must show
-the audience before anything is submitted.
+(`Audience confirmed by Facebook: 僅限訂閱者`); on the opt-in composer path
+(`--image --composer`) the picker's radio must actually flip and the composer
+must show the audience before anything is submitted.
 
 Note that a subscriber post can't be rehearsed with `--privacy SELF` — the
 audiences are different objects. Verify a real one from a logged-out browser
@@ -111,13 +111,18 @@ uv run fb post "Later post" --privacy EVERYONE --schedule "2026-07-18 11:00"
 
 The schedule time must be at least 10 minutes out (Facebook's minimum) and is
 your machine's local time, sent as an absolute epoch — no account-timezone
-ambiguity. Only `--image` still routes through the browser composer (photo
-upload has no GraphQL fast path), where the schedule goes into the zh-TW UI:
-the time is typed and read back, the date is chosen from the calendar popup
-(writing into that field changes only what you see, not what Facebook stores),
-and both are re-checked against the Content Library afterwards. Facebook's own
-picker only allows roughly 30 days ahead — asking for a later date fails
-loudly instead of quietly publishing on the wrong day.
+ambiguity. Photo posts take the same path: `--image` uploads to the composer's
+own upload endpoint and passes the returned photo id to the post mutation, so
+no browser is involved and a long post no longer spends minutes being typed
+character by character.
+
+If Facebook ever changes that endpoint, `--image --composer` forces the old
+browser path, where the schedule goes into the zh-TW UI: the time is typed and
+read back, the date is chosen from the calendar popup (writing into that field
+changes only what you see, not what Facebook stores), and both are re-checked
+against the Content Library afterwards. Facebook's own picker only allows
+roughly 30 days ahead — asking for a later date fails loudly instead of
+quietly publishing on the wrong day.
 
 Pre-write a comment on the new post in the same command — handy for the
 "link in comments" habit; it works on scheduled posts before they publish:
@@ -127,11 +132,10 @@ uv run fb post "Post text" --privacy EVERYONE \
   --schedule "2026-07-18 11:00" --comment "https://example.com/article"
 ```
 
-This now works with `--image` too, as long as the post is scheduled: a photo
-post goes through the browser composer, which returns no post_id, so the id is
-read back from the Content Library preview before the comment is sent. (An
-*immediate* photo post still can't be commented on in one command — publish
-first, then `fb comment <post_id>`.)
+This works with `--image` as well, scheduled or immediate, because the photo
+path returns a post id directly. (With the `--composer` fallback the post must
+be scheduled, since the browser path returns no id — it is then read back from
+the Content Library preview before the comment is sent.)
 
 Or comment on any of your own posts later (numeric post_id printed by
 `fb post`, or the base64 story ID):

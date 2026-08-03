@@ -24,6 +24,7 @@ from scripts.fb_session import (
     fetch_story_text,
     fetch_story_privacy,
     resolve_privacy_row,
+    upload_photo,
     PLAIN_PRIVACY_STATES,
 )
 
@@ -164,19 +165,19 @@ def _warn_if_schedule_drifted(when: str, requested: str):
 
 def cmd_post(args):
     """Post text to Facebook."""
-    if args.image:
-        # Photo upload isn't supported by the raw GraphQL mutation below —
-        # drive the real composer UI instead. (Scheduling IS GraphQL now:
-        # unpublished_content_data on ComposerStoryCreateMutation.)
+    if args.image and args.composer:
+        # Opt-in fallback: drive the real composer UI. Kept for the case where
+        # the upload endpoint changes and the API path stops working; the
+        # default photo path is GraphQL (upload_photo + attachments) below.
         if args.comment and not args.schedule:
             # Published immediately, so there is no Content Library row to read
             # the id off — the only route left is scraping /me for the newest
             # post, which can't tell a SELF dry run from the real thing.
             print(
-                "Error: --comment with --image needs --schedule (the scheduled "
-                "post's id is resolvable from the Content Library). For an "
-                "immediate photo post, publish first, then "
-                "'fb comment <post_id> \"text\"'.",
+                "Error: --comment with --image --composer needs --schedule (the "
+                "scheduled post's id is resolvable from the Content Library). "
+                "Drop --composer to use the GraphQL path, which returns the id "
+                "directly.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -229,6 +230,14 @@ def cmd_post(args):
     if args.privacy not in PLAIN_PRIVACY_STATES:
         print(f"  audience: {args.privacy} -> {json.dumps(privacy_row)}")
 
+    # A photo is uploaded first and referenced by id — same two-step the
+    # composer does, minus the browser.
+    attachments = []
+    if args.image:
+        print("\nUploading photo...")
+        photo_id = upload_photo(session, tokens, actor_id, args.image)
+        attachments = [{"photo": {"id": photo_id}}]
+
     session_id = str(uuid.uuid4())
     variables = {
         "input": {
@@ -236,7 +245,7 @@ def cmd_post(args):
             "composer_source_surface": "timeline",
             "idempotence_token": f"{session_id}_FEED",
             "source": "WWW",
-            "attachments": [],
+            "attachments": attachments,
             "audience": {"privacy": privacy_row},
             "message": {"ranges": [], "text": args.text},
             "with_tags_ids": None,
@@ -848,7 +857,7 @@ def main():
         "SUBSCRIBERS post from a logged-out browser instead.",
     )
     post_parser.add_argument(
-        "--image", help="Path to an image to attach (routes through the browser composer, not the GraphQL fast path)",
+        "--image", help="Path to an image to attach (uploaded via the API, then referenced by the post)",
     )
     post_parser.add_argument(
         "--schedule",
@@ -859,11 +868,17 @@ def main():
     post_parser.add_argument(
         "--comment",
         help="After posting/scheduling, pre-write this as a top-level comment "
-        "on the new post (e.g. the article URL). GraphQL path only (not with --image).",
+        "on the new post (e.g. the article URL). Works with --image too, since "
+        "photos now go through the GraphQL path.",
+    )
+    post_parser.add_argument(
+        "--composer", action="store_true",
+        help="Force the browser composer for --image instead of the API upload "
+             "(fallback if Facebook changes the upload endpoint)",
     )
     post_parser.add_argument(
         "--headless", action="store_true",
-        help="Run headless when --image is used (default: headed)",
+        help="Run headless when --image --composer is used (default: headed)",
     )
 
     # comment (top-level comment on own post, incl. scheduled posts)

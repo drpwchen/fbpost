@@ -5,6 +5,40 @@ Originally forked from [htlin222/fbpost](https://github.com/htlin222/fbpost);
 maintained standalone since 2026-07-30 (upstream inactive since March 2026,
 PRs #1/#2 closed unmerged). MIT license and original copyright retained.
 
+## [0.6.0] - 2026-08-03
+
+### Added
+
+- `fb post --image` now goes through the API instead of the browser composer.
+  Photos are uploaded to the composer's own endpoint
+  (`upload.facebook.com/ajax/react_composer/attachments/photo/upload`, form
+  fields `source=8` / `profile_id` / `waterfallxapp=comet` / `farr` /
+  `upload_id`) and the returned `photoID` is passed to
+  `ComposerStoryCreateMutation` as `attachments: [{"photo": {"id": ...}}]`.
+  A long photo post used to take many minutes of per-character typing in a
+  real browser and could time out with no way to tell whether it had been
+  published; it is now a couple of seconds and returns the post id.
+  Captured by hooking `XMLHttpRequest.send` in the page — Playwright cannot
+  read a multipart request body, and every parameter but the form fields
+  lives in the query string.
+- `fb post --image --composer` keeps the old browser path as an opt-in
+  fallback in case Facebook changes the upload endpoint.
+
+### Fixed
+
+- `--comment` now works with `--image`. It previously required `--schedule`
+  because the composer path returned no post id; the API path returns one, so
+  the URL-in-a-comment habit works on immediate photo posts too.
+
+### Notes
+
+- `graphql_request()` leaves `Content-Type: application/x-www-form-urlencoded`
+  on the shared session. Uploading after any GraphQL call therefore sent a
+  multipart body labelled urlencoded and Facebook answered 400 — which hit
+  exactly the `--privacy SUBSCRIBERS` path, since resolving the subscriber
+  list id is itself a GraphQL call. `upload_photo()` now removes that header
+  (and `X-FB-Friendly-Name`) for its own request and restores them after.
+
 ## [0.5.0] - 2026-07-31
 
 ### Added
