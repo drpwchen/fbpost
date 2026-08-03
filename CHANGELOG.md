@@ -5,6 +5,22 @@ Originally forked from [htlin222/fbpost](https://github.com/htlin222/fbpost);
 maintained standalone since 2026-07-30 (upstream inactive since March 2026,
 PRs #1/#2 closed unmerged). MIT license and original copyright retained.
 
+## [0.7.1] - 2026-08-03
+
+### Fixed
+
+- `fb post --schedule --comment` no longer fails the comment half. Commenting
+  straight after the post mutation raced Facebook's own indexing and came back
+  as error 1446013「貼文已移除」, so the documented one-command form silently
+  needed a manual `post-list-scheduled` + `comment-scheduled` afterwards.
+  `--comment` now resolves the post through the Content Library (matching the
+  story id, falling back to the post text) — the same route
+  `comment-scheduled` takes — and retries the comment while Facebook catches
+  up. The schedule time stored by Facebook is checked against the requested one
+  on the way past.
+- When the comment still cannot be placed, the post is reported as scheduled
+  (it is) and the failure names the two-step recovery. It is never re-posted.
+
 ## [0.7.0] - 2026-08-03
 
 ### Added

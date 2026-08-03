@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from datetime import datetime, timedelta
 
@@ -85,13 +86,13 @@ def _resolve_post_id(raw: str) -> str:
     sys.exit(1)
 
 
-def _create_comment(session, tokens, actor_id, post_id: str, text: str):
+def _try_comment(session, tokens, actor_id, post_id: str, text: str):
     """Create a TOP-LEVEL comment on one of our own posts via GraphQL.
 
     Works on scheduled (unpublished) posts too — feedback:<post_id> resolves
     before publish, which is what lets us pre-write the URL comment the user
-    parks under each post. Exits non-zero unless FB returns the created
-    comment edge (no blind success)."""
+    parks under each post. Returns (ok, data); ok is True only when Facebook
+    hands back the created comment edge (no blind success)."""
     feedback_id = base64.b64encode(f"feedback:{post_id}".encode()).decode()
     session_id = str(uuid.uuid4())
     variables = {
@@ -126,22 +127,34 @@ def _create_comment(session, tokens, actor_id, post_id: str, text: str):
         "useCometUFICreateCommentMutation", variables,
     )
     if "errors" in data:
-        print("Error from Facebook while commenting:", file=sys.stderr)
-        print(json.dumps(data["errors"], indent=2, ensure_ascii=False), file=sys.stderr)
-        sys.exit(1)
+        return False, data
     cc = (data.get("data") or {}).get("comment_create") or {}
     node = (cc.get("feedback_comment_edge") or {}).get("node") or {}
     body = (node.get("preferred_body") or node.get("body") or {}).get("text", "")
-    if node.get("id") and text in body:
-        print(f"Comment created on post {post_id}: {text}")
-    else:
-        print(
-            "FAILED: Facebook did not return the created comment — "
-            "comment may NOT have been posted.",
-            file=sys.stderr,
-        )
-        print(json.dumps(data, ensure_ascii=False)[:800], file=sys.stderr)
+    return bool(node.get("id") and text in body), data
+
+
+def _report_comment_failure(data):
+    """Print whatever Facebook said about a comment that did not land."""
+    if "errors" in data:
+        print("Error from Facebook while commenting:", file=sys.stderr)
+        print(json.dumps(data["errors"], indent=2, ensure_ascii=False), file=sys.stderr)
+        return
+    print(
+        "FAILED: Facebook did not return the created comment — "
+        "comment may NOT have been posted.",
+        file=sys.stderr,
+    )
+    print(json.dumps(data, ensure_ascii=False)[:800], file=sys.stderr)
+
+
+def _create_comment(session, tokens, actor_id, post_id: str, text: str):
+    """Comment on one of our own posts, exiting non-zero if it did not land."""
+    ok, data = _try_comment(session, tokens, actor_id, post_id, text)
+    if not ok:
+        _report_comment_failure(data)
         sys.exit(1)
+    print(f"Comment created on post {post_id}: {text}")
 
 
 def _warn_if_schedule_drifted_epoch(stored: int, requested: str):
@@ -189,6 +202,76 @@ def _warn_if_schedule_drifted(when: str, requested: str):
         )
 
 
+def _find_scheduled_row(session, tokens, actor_id, story_id="", text="", attempts=3):
+    """Find the Content Library row for a post we have just scheduled.
+
+    Matched on the story id when the API gave us one; otherwise on the post's
+    own text, which must hit exactly one row. Retries because a freshly
+    scheduled post can take a few seconds to show up in the library.
+    """
+    wanted = " ".join((text or "").split())[:60]
+    story_key = (story_id or "").rstrip("=")
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(4)
+        rows = fetch_content_library(session, tokens, actor_id, "SCHEDULED", limit=40)
+        if story_key:
+            hits = [r for r in rows if r["story_id"].rstrip("=") == story_key]
+            if hits:
+                return hits[0]
+        if wanted:
+            hits = [r for r in rows if wanted in " ".join(r["text"].split())]
+            if len(hits) == 1:
+                return hits[0]
+    return None
+
+
+def _comment_on_scheduled(session, tokens, actor_id, comment, schedule_at,
+                          story_id="", text="", attempts=3):
+    """Attach --comment to a post that is scheduled, not published.
+
+    The id `ComposerStoryCreateMutation` returns is not commentable while the
+    post sits unpublished — Facebook answers 1446013「貼文已移除」. The id the
+    Content Library reports for the same row is, which is what
+    `fb comment-scheduled` uses; this routes there automatically so one
+    command still does the whole job. Exits non-zero if the comment never
+    lands: the post is already scheduled at that point, so the two-step
+    recovery is printed instead of retrying the post.
+    """
+    print("Resolving the scheduled post in the Content Library "
+          "(its published id is not commentable yet)...")
+    row = _find_scheduled_row(
+        session, tokens, actor_id, story_id=story_id, text=text,
+    )
+    if not row:
+        print(
+            "The post IS scheduled, but its Content Library row could not be "
+            "resolved — no comment was added. Run 'fb post-list-scheduled' "
+            "then 'fb comment-scheduled <#> \"text\" --match \"...\"'.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    post_id = row["post_id"]
+    print(f"  post_id: {post_id} ({_fmt_epoch(row['scheduled']) or row['when_text']})")
+    _warn_if_schedule_drifted_epoch(row["scheduled"], schedule_at)
+    data = {}
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(5)
+        ok, data = _try_comment(session, tokens, actor_id, post_id, comment)
+        if ok:
+            print(f"Comment created on post {post_id}: {comment}")
+            return
+    _report_comment_failure(data)
+    print(
+        "The post itself IS scheduled — only the comment failed. Retry with "
+        "'fb post-list-scheduled' then "
+        "'fb comment-scheduled <#> \"text\" --match \"...\"'.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def cmd_post(args):
     """Post text to Facebook."""
     if args.image and args.composer:
@@ -216,26 +299,13 @@ def cmd_post(args):
             headless=args.headless,
         ))
         if args.comment:
-            # The composer prints no post_id; the Content Library preview knows
-            # it. Pick our row by its own text (must match exactly one row).
-            print("\nResolving the scheduled post's id to attach the comment...")
+            # The composer prints no post_id; the Content Library knows it.
+            print()
             session, tokens, actor_id = _content_session(args.profile)
-            rows = fetch_content_library(session, tokens, actor_id, "SCHEDULED", limit=40)
-            wanted = " ".join(args.text.split())[:60]
-            hits = [r for r in rows if wanted in " ".join(r["text"].split())]
-            if len(hits) != 1:
-                print(
-                    "The post IS scheduled, but its id could not be resolved "
-                    f"({len(hits)} rows matched its text) — no comment was added. "
-                    "Run 'fb post-list-scheduled' then "
-                    "'fb comment-scheduled <#> \"text\"'.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            row = hits[0]
-            print(f"  post_id: {row['post_id']} ({_fmt_epoch(row['scheduled'])})")
-            _warn_if_schedule_drifted_epoch(row["scheduled"], args.schedule)
-            _create_comment(session, tokens, actor_id, row["post_id"], args.comment)
+            _comment_on_scheduled(
+                session, tokens, actor_id, args.comment, args.schedule,
+                text=args.text,
+            )
         return
 
     schedule_epoch = _parse_schedule(args.schedule) if args.schedule else None
@@ -385,7 +455,13 @@ def cmd_post(args):
 
     if args.comment and post_id:
         print()
-        _create_comment(session, tokens, actor_id, str(post_id), args.comment)
+        if schedule_epoch:
+            _comment_on_scheduled(
+                session, tokens, actor_id, args.comment, args.schedule,
+                story_id=story_create.get("story_id") or "", text=args.text,
+            )
+        else:
+            _create_comment(session, tokens, actor_id, str(post_id), args.comment)
 
 
 # ── Comments ─────────────────────────────────────────────────────────────────

@@ -168,6 +168,14 @@ path returns a post id directly. (With the `--composer` fallback the post must
 be scheduled, since the browser path returns no id — it is then read back from
 the Content Library preview before the comment is sent.)
 
+With `--schedule` the comment cannot go to the id the post mutation returns:
+while the post sits unpublished, Facebook answers that id with *"this post has
+been removed"*. So `--comment` looks the post up in the Content Library and
+comments on the id from there — the route `fb comment-scheduled` takes — and
+retries while Facebook indexes the new row. If it still fails, the command says
+so and points at the manual two-step; the post itself is already scheduled at
+that point and is never re-posted.
+
 Or comment on any of your own posts later (numeric post_id printed by
 `fb post`, or the base64 story ID):
 
