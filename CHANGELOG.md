@@ -5,6 +5,49 @@ Originally forked from [htlin222/fbpost](https://github.com/htlin222/fbpost);
 maintained standalone since 2026-07-30 (upstream inactive since March 2026,
 PRs #1/#2 closed unmerged). MIT license and original copyright retained.
 
+## [0.7.0] - 2026-08-03
+
+### Added
+
+- `fb post-list-published` — list your own published posts (time, `post_id`,
+  views, engagement, group, preview) from the Content Library. Until now there
+  was no way to confirm from the CLI that a post actually went out: scraping
+  the profile page does not load the post wall for a profile like this, so a
+  post that timed out mid-publish could not be checked at all.
+- `fb post-delete` — delete a published post, by `--post-id` or by index from
+  `post-list-published`. An index requires `--match`, since the list shifts as
+  posts publish and a published post cannot be restored.
+- `graphql_chunks()` in `fb_session` — returns every chunk of a deferred
+  GraphQL response. The Content Library streams its table as a later chunk of
+  the same response, so `graphql_request()` (first chunk only) sees an empty
+  shell.
+
+### Changed
+
+- `post-list-scheduled`, `post-delete-scheduled` and `comment-scheduled` now go
+  through the Content Library GraphQL API instead of driving the dashboard in a
+  browser. Each is a couple of seconds instead of tens of seconds, the numeric
+  `post_id` is always listed (`--ids` used to cost ~10s per post), and the
+  schedule time is read as an epoch rather than parsed from localized text like
+  "已排定 • 明天上午8:30". The old browser implementation is kept behind
+  `--browser` in case Facebook changes the query.
+- Scheduled deletion is verified by re-reading the library and checking the
+  story is gone, rather than by watching a row count that could be stale.
+- `fb post --image --composer --comment` resolves the new post's id from the
+  library too, and compares the stored epoch against the requested time instead
+  of re-parsing the dashboard's localized schedule line.
+
+### Notes
+
+- The Content Library pagination query takes the library's own page id, not the
+  `c_user` id — passing `c_user` resolves a `User` node that has no content
+  library on it and returns nothing. The id comes back with the first page.
+- Listing order is Facebook's, not chronological, and it differs from the old
+  browser listing. `--match` on delete is what makes an index safe; it caught a
+  wrong-row delete during testing.
+- `pyproject.toml` was still declaring 0.5.0 through the 0.6.0 release; it now
+  tracks the released version again.
+
 ## [0.6.0] - 2026-08-03
 
 ### Added

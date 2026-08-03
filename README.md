@@ -9,7 +9,7 @@ Facebook CLI tool — post, comments, replies, and Messenger automation via Grap
 >
 > - `fb post --image` (photo attachments) and `--schedule` (scheduled posts), both via pure GraphQL
 > - `fb post --comment` / `fb comment` — pre-write a top-level comment on a post, including scheduled posts before they publish ("link in comments")
-> - `fb post-list-scheduled` / `fb comment-scheduled` / `fb post-delete-scheduled` — manage scheduled posts from the CLI, including commenting on one before it publishes
+> - `fb post-list-scheduled` / `fb post-list-published` / `fb comment-scheduled` / `fb post-delete-scheduled` / `fb post-delete` — list, comment on, and delete your own posts from the CLI, scheduled or already published, all through the Content Library GraphQL API
 > - `fb report` — create and download a Professional Dashboard content data report (CSV) in one command, plus `scripts/report_to_md.py` to turn it into a markdown tracking table
 > - A reliability sweep: daemon-safe teardown everywhere, cookie-based login verification, honest post-send verification (several code paths used to report success without checking), wrong-contact guards in `fb search`, Windows support fixes, and event-driven waits that cut 3-12s of fixed sleeps per command
 >
@@ -144,38 +144,45 @@ Or comment on any of your own posts later (numeric post_id printed by
 uv run fb comment 1234567890123456 "https://example.com/article"
 ```
 
-### Scheduled posts — List / Comment / Delete
+### Your posts — List / Comment / Delete
 
-Scheduled posts live in the Professional Dashboard's Content Library
-(**Content → Scheduled** tab); for a personal profile with no Page, Meta
-Business Suite is unavailable, so these commands drive that tab.
+Your own posts live in the Professional Dashboard's Content Library (**已發佈**
+and **已排定發佈** tabs); for a personal profile with no Page, Meta Business
+Suite is unavailable, so that library is the source of truth. These commands
+query it over GraphQL — a couple of seconds each, no browser.
 
 ```bash
-uv run fb post-list-scheduled              # list scheduled posts with a 1-based index
-uv run fb post-list-scheduled --ids        # ...and resolve each post_id (~10s per post)
+uv run fb post-list-scheduled              # scheduled posts: index, time, post_id, preview
+uv run fb post-list-published              # published posts: same, plus views / engagement
+uv run fb post-list-published --count 25 --days LAST_90D
+
 uv run fb comment-scheduled 2 "https://example.com/article"     # comment on a post that hasn't published yet
 uv run fb comment-scheduled 2 "text" --match "draft about cats" # abort if row 2 doesn't contain this text
-uv run fb post-delete-scheduled 2          # delete the post shown at index 2
-uv run fb post-delete-scheduled 2 --match "draft about cats"   # abort if row 2 doesn't contain this text
+
+uv run fb post-delete-scheduled 2 --match "draft about cats"   # delete a scheduled post
+uv run fb post-delete --post-id 1234567890                     # delete a PUBLISHED post by id
+uv run fb post-delete 3 --match "draft about cats"             # ...or by index from post-list-published
 ```
 
-All three scroll until the lazy-loaded table stops growing (and wait for the
-row count to hold still, since Facebook briefly mounts empty skeleton rows), so
-the index covers ALL scheduled posts and never points at a placeholder.
-`post-delete-scheduled` resolves the index freshly in its own session, prints
-exactly what it is about to delete, aborts if `--match` text isn't in that row,
-and re-verifies the scheduled count actually dropped before reporting success.
+`post-list-published` is the only reliable way to confirm a post really went
+out: scraping the profile page does not load the post wall for this kind of
+account, so a post made through the API had nothing to check against.
 
-`comment-scheduled` is the browser half of `fb comment`: a scheduled post's
-row carries no id, so it opens that row's post preview — the same dialog the
-Content Library gives you for commenting by hand — and reads the post_id out
-of the response that renders it, then comments over the normal GraphQL path.
-The comment is waiting under the post the moment it publishes.
+Every destructive command resolves the index freshly, prints exactly what it is
+about to delete, aborts when the `--match` text is not in that row, and
+re-reads the library afterwards to confirm the post is gone before reporting
+success. `post-delete` additionally *requires* `--match` when you pass an
+index, because a published post cannot be restored — pass `--post-id` when you
+want to skip indexing.
 
-Like the other read-only commands, `post-list-scheduled` and
-`comment-scheduled` are headless by default (`--no-headless` to watch).
-Deletion is destructive, so `post-delete-scheduled` is headed by default
-(`--headless` to hide).
+`comment-scheduled` fills the gap `fb comment` leaves: it looks the scheduled
+post's id up in the library and comments over the normal GraphQL path, so the
+comment is waiting under the post the moment it publishes.
+
+The listings and deletes take `--browser` to fall back to driving the dashboard
+UI, in case Facebook changes the Content Library query. That path is the old
+implementation, kept intact: `--no-headless` to watch a listing, `--headless`
+to hide the (headed by default) delete.
 
 ### Content data report (post analytics export)
 
@@ -333,13 +340,16 @@ profiles/
 
 ## How It Works
 
-### GraphQL API (post, comments, reply)
+### GraphQL API (post, photos, listing, deleting, comments, reply)
 
 - Loads cookies from `profiles/<name>/cookies.json`
 - Uses `i_user` cookie as actor ID for fan page profiles, `c_user` for personal
 - Fetches CSRF tokens (`fb_dtsg`, `lsd`, etc.) from Facebook homepage
 - Auto-detects `pageID` from the Professional Dashboard page
 - Uses Facebook's internal GraphQL API (`/api/graphql/`) with Relay doc IDs
+- Reads deferred responses in full: the Content Library streams its table as
+  later chunks of one response, so those queries collect every chunk instead of
+  the first one
 
 ### Playwright Browser Automation (login, messenger)
 

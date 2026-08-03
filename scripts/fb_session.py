@@ -1,5 +1,6 @@
 """Shared Facebook session, cookies, tokens, and GraphQL helpers."""
 
+import base64
 import json
 import os
 import re
@@ -238,16 +239,9 @@ def fetch_tokens(session: requests.Session) -> dict[str, str]:
     return tokens
 
 
-def graphql_request(
-    session: requests.Session,
-    tokens: dict[str, str],
-    actor_id: str,
-    doc_id: str,
-    friendly_name: str,
-    variables: dict,
-) -> dict:
-    """POST to /api/graphql/ with token injection and response parsing."""
-    form_data = {
+def _graphql_form(tokens, actor_id, doc_id, friendly_name, variables) -> dict:
+    """Build the form body every /api/graphql call shares."""
+    return {
         "av": actor_id,
         "__user": actor_id,
         "__a": "1",
@@ -270,6 +264,11 @@ def graphql_request(
         "doc_id": doc_id,
     }
 
+
+def _graphql_post(session, tokens, actor_id, doc_id, friendly_name, variables):
+    """Send the request and return its raw body, minus the anti-JSON prefix."""
+    form_data = _graphql_form(tokens, actor_id, doc_id, friendly_name, variables)
+
     session.headers.update({
         "Accept": "*/*",
         "Content-Type": "application/x-www-form-urlencoded",
@@ -281,13 +280,68 @@ def graphql_request(
         "X-FB-Friendly-Name": friendly_name,
     })
 
-    resp = session.post(GRAPHQL_URL, data=form_data, timeout=30)
+    resp = session.post(GRAPHQL_URL, data=form_data, timeout=60)
 
     if resp.status_code != 200:
         print(f"Error: HTTP {resp.status_code}", file=sys.stderr)
         print(resp.text[:500], file=sys.stderr)
         sys.exit(1)
 
+    body = resp.text
+    if body.startswith("for (;;);"):
+        body = body[len("for (;;);"):]
+    return body
+
+
+def graphql_chunks(
+    session: requests.Session,
+    tokens: dict[str, str],
+    actor_id: str,
+    doc_id: str,
+    friendly_name: str,
+    variables: dict,
+) -> list[dict]:
+    """Return EVERY JSON chunk of a GraphQL response, in arrival order.
+
+    Queries that defer part of their tree (the Content Library table is one)
+    answer with several newline-separated JSON objects: a first payload marked
+    `is_final: false`, then `label`/`path` chunks carrying the deferred data.
+    graphql_request() returns only the first chunk with a `data` key, which for
+    those queries is the shell — the rows look missing when they are simply in
+    a later chunk.
+    """
+    body = _graphql_post(session, tokens, actor_id, doc_id, friendly_name, variables)
+    chunks = []
+    for line in body.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            chunks.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    if not chunks:
+        print("Error: Could not parse response JSON", file=sys.stderr)
+        print(body[:500], file=sys.stderr)
+        sys.exit(1)
+    errors = [e for c in chunks for e in (c.get("errors") or [])]
+    if errors and not any(c.get("data") for c in chunks):
+        print("Error: GraphQL request failed:", file=sys.stderr)
+        for err in errors:
+            print(f"  {err.get('message', err)}", file=sys.stderr)
+        sys.exit(1)
+    return chunks
+
+
+def graphql_request(
+    session: requests.Session,
+    tokens: dict[str, str],
+    actor_id: str,
+    doc_id: str,
+    friendly_name: str,
+    variables: dict,
+) -> dict:
+    """POST to /api/graphql/ with token injection and response parsing."""
     def _check_graphql_errors(data):
         # An HTTP 200 can still carry a GraphQL-level failure (expired
         # token, rate limit, permission). Returning it as success makes
@@ -299,9 +353,7 @@ def graphql_request(
             sys.exit(1)
         return data
 
-    body = resp.text
-    if body.startswith("for (;;);"):
-        body = body[len("for (;;);"):]
+    body = _graphql_post(session, tokens, actor_id, doc_id, friendly_name, variables)
 
     try:
         return _check_graphql_errors(json.loads(body))
@@ -558,6 +610,183 @@ def fetch_story_privacy(session, tokens, actor_id, story_id: str) -> dict | None
         "label": labelled.get("label", ""),
         "allow": list(row.get("allow") or []),
     }
+
+
+# ── Content Library (published / scheduled posts) ────────────────────────────
+
+CONTENT_LIBRARY_PV_FLAGS = {
+    "__relay_internal__pv__ProdashWebContentLibraryDeferTableGKrelayprovider": True,
+    "__relay_internal__pv__ContentLibraryStatusColumnGKrelayprovider": False,
+    "__relay_internal__pv__CometUFI_dedicated_comment_routable_dialog_gkrelayprovider": True,
+    "__relay_internal__pv__enableProdashWebCrossPostInsightsrelayprovider": True,
+    "__relay_internal__pv__ContentLibraryUnifiedContentStatusGKrelayprovider": True,
+}
+
+# The tabs of the Content Library, as its `routeFilter` / `filteringOption`.
+CONTENT_FILTERS = ("PUBLISHED", "SCHEDULED", "DRAFT")
+CONTENT_DATE_RANGES = ("LAST_7D", "LAST_28D", "LAST_90D")
+
+
+def _find_key(node, key):
+    """Depth-first search for the first dict value stored under `key`."""
+    if isinstance(node, dict):
+        found = node.get(key)
+        if isinstance(found, dict):
+            return found
+        for value in node.values():
+            found = _find_key(value, key)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_key(value, key)
+            if found is not None:
+                return found
+    return None
+
+
+def post_id_from_story_id(story_id: str) -> str:
+    """Pull the numeric post id out of a base64 story id.
+
+    Story ids decode to `S:_I<actor>:<post_id>` (timeline), the same with the
+    post id repeated, or `S:_I<actor>:VK:<post_id>` for a post in a group.
+    """
+    try:
+        raw = base64.b64decode(story_id + "==").decode("utf-8", "replace")
+    except Exception:
+        return ""
+    digits = [part for part in raw.split(":") if part.isdigit()]
+    return digits[-1] if digits else ""
+
+
+def _content_entry(node: dict) -> dict:
+    """Flatten one Content Library row into the fields the CLI prints."""
+    story = node.get("story") or {}
+    insights = ((node.get("tofu_entity") or {}).get("entity_insights")) or {}
+    story_id = story.get("id") or ""
+    group = (story.get("target_group") or {}).get("name") or ""
+    return {
+        "story_id": story_id,
+        "post_id": post_id_from_story_id(story_id),
+        "text": (node.get("title") or "").strip(),
+        "when_text": node.get("timestamp_text") or "",
+        "created": story.get("creation_time") or 0,
+        "scheduled": story.get("scheduled_publish_time") or 0,
+        "status": story.get("unpublished_content_type") or "",
+        "url": story.get("url") or "",
+        "group": group,
+        "views": ((insights.get("views") or {}).get("value")),
+        "engagement": ((insights.get("engagement") or {}).get("value")),
+        "kind": node.get("business_content_type") or "",
+    }
+
+
+def fetch_content_library(
+    session, tokens, actor_id, filtering: str = "SCHEDULED",
+    limit: int = 20, date_range: str = "LAST_28D",
+) -> list[dict]:
+    """List the account's own posts from the Content Library, newest first.
+
+    `filtering` picks the tab (PUBLISHED / SCHEDULED / DRAFT). This is the same
+    data the dashboard's table shows, so it is also the only reliable way to
+    confirm a post really was published — a profile page scrape does not load
+    the post wall for this account.
+    """
+    from scripts.fb_config import CONTENT_LIBRARY_DOC_ID, CONTENT_LIBRARY_PAGE_DOC_ID
+
+    variables = {
+        "isExportEnabled": True, "isMonetizationEnabled": True,
+        "pageID": actor_id, "ref": None,
+        "routeDateRange": date_range, "routeEndDate": None,
+        "routeFilter": filtering, "routeKeyword": None,
+        "routePlacementType": "ALL", "routePostType": "ALL_CONTENT",
+        "routePostTypes": None, "routeSortBy": "DATE",
+        "routeSortingMethod": "METRICS_DESCENDING", "routeStartDate": None,
+        "routeTranslationTypeFilter": None, "shouldFetchOptimalTime": False,
+        **CONTENT_LIBRARY_PV_FLAGS,
+    }
+    chunks = graphql_chunks(
+        session, tokens, actor_id, CONTENT_LIBRARY_DOC_ID,
+        "ProdashCometV2ContentLibraryQuery", variables,
+    )
+    conn, page_id = None, None
+    for chunk in chunks:
+        conn = _find_key(chunk, "prodash_content_library")
+        if conn:
+            # The table chunk carries the library's own page id next to it;
+            # the pagination query needs that id, not the c_user id.
+            data = chunk.get("data") or {}
+            page_id = data.get("id") or _find_key(chunk, "node") or actor_id
+            if isinstance(page_id, dict):
+                page_id = page_id.get("id", actor_id)
+            break
+    if not conn:
+        return []
+
+    entries = [_content_entry(e["node"]) for e in conn.get("edges", []) if e.get("node")]
+    info = conn.get("page_info") or {}
+
+    pv_page = {k: v for k, v in CONTENT_LIBRARY_PV_FLAGS.items() if "DeferTable" not in k}
+    while len(entries) < limit and info.get("has_next_page") and info.get("end_cursor"):
+        page_vars = {
+            "after": info["end_cursor"], "customEndDate": None, "customStartDate": None,
+            "dateRange": date_range, "filteringOption": filtering,
+            "first": min(25, limit - len(entries)), "isMonetizationEnabled": True,
+            "keyword": None, "metricAddOnType": "DATE", "placementType": "ALL",
+            "postType": "ALL_CONTENT", "postTypes": None,
+            "sortingMethod": "METRICS_DESCENDING", "translationTypeFilter": None,
+            "id": page_id, **pv_page,
+        }
+        page_chunks = graphql_chunks(
+            session, tokens, actor_id, CONTENT_LIBRARY_PAGE_DOC_ID,
+            "ProdashCometV2ContentLibraryPaginationQuery", page_vars,
+        )
+        conn = None
+        for chunk in page_chunks:
+            conn = _find_key(chunk, "prodash_content_library")
+            if conn:
+                break
+        if not conn or not conn.get("edges"):
+            break
+        entries.extend(
+            _content_entry(e["node"]) for e in conn["edges"] if e.get("node")
+        )
+        info = conn.get("page_info") or {}
+
+    return entries[:limit]
+
+
+def delete_story(session, tokens, actor_id, story_id: str) -> bool:
+    """Delete one of the account's own stories (published or scheduled).
+
+    Same mutation the post's ⋯ menu fires. Returns True only when Facebook
+    answers with the deleted story — callers still re-list to confirm, since a
+    mutation reporting success is not proof the row is gone.
+    """
+    from scripts.fb_config import STORY_DELETE_DOC_ID
+
+    variables = {
+        "input": {
+            "story_id": story_id,
+            "story_location": "PERMALINK",
+            "actor_id": actor_id,
+            "client_mutation_id": "1",
+        },
+        "groupID": None,
+        "inviteShortLinkKey": None,
+        "renderLocation": None,
+        "scale": 2,
+        "__relay_internal__pv__groups_comet_use_glvrelayprovider": False,
+    }
+    data = graphql_request(
+        session, tokens, actor_id, STORY_DELETE_DOC_ID,
+        "useCometFeedStoryDeleteMutation", variables,
+    )
+    if data.get("errors"):
+        for err in data["errors"]:
+            print(f"  {err.get('message', err)}", file=sys.stderr)
+        return False
+    return bool((data.get("data") or {}).get("story_delete"))
 
 
 # ── Photo upload ─────────────────────────────────────────────────────────────

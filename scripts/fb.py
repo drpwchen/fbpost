@@ -14,9 +14,12 @@ from datetime import datetime, timedelta
 from scripts.fb_config import COMMENTS_DOC_ID, POST_DOC_ID, REPLY_DOC_ID
 from scripts.fb_session import (
     COMMENTS_RELAY_PV_FLAGS,
+    CONTENT_DATE_RANGES,
     POST_RELAY_PV_FLAGS,
     REPLY_RELAY_PV_FLAGS,
     create_session,
+    delete_story,
+    fetch_content_library,
     fetch_tokens,
     graphql_request,
     load_cookies,
@@ -141,6 +144,29 @@ def _create_comment(session, tokens, actor_id, post_id: str, text: str):
         sys.exit(1)
 
 
+def _warn_if_schedule_drifted_epoch(stored: int, requested: str):
+    """Compare the time Facebook stored on the post with what was asked for.
+
+    The composer types the time as text into localized fields, so this reads
+    back the epoch Facebook actually kept — the drift that used to publish a
+    post on the wrong day showed up exactly here.
+    """
+    if not stored:
+        return
+    try:
+        wanted = datetime.strptime(requested, "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return
+    actual = datetime.fromtimestamp(stored)
+    if abs((actual - wanted).total_seconds()) > 60:
+        print(
+            f"WARNING: scheduled for {actual:%Y-%m-%d %H:%M}, but you asked for "
+            f"{wanted:%Y-%m-%d %H:%M}. Facebook did not keep the requested time — "
+            "delete it with 'fb post-delete-scheduled' and reschedule.",
+            file=sys.stderr,
+        )
+
+
 def _warn_if_schedule_drifted(when: str, requested: str):
     """Compare the Content Library's own schedule line with what we asked for.
 
@@ -193,25 +219,23 @@ def cmd_post(args):
             # The composer prints no post_id; the Content Library preview knows
             # it. Pick our row by its own text (must match exactly one row).
             print("\nResolving the scheduled post's id to attach the comment...")
-            from scripts.fb_browser import resolve_scheduled_post_id
-            info = asyncio.run(resolve_scheduled_post_id(
-                args.profile, contains=args.text[:60], headless=True,
-            ))
-            if not info:
+            session, tokens, actor_id = _content_session(args.profile)
+            rows = fetch_content_library(session, tokens, actor_id, "SCHEDULED", limit=40)
+            wanted = " ".join(args.text.split())[:60]
+            hits = [r for r in rows if wanted in " ".join(r["text"].split())]
+            if len(hits) != 1:
                 print(
-                    "The post IS scheduled, but its id could not be resolved — "
-                    "no comment was added. Run 'fb post-list-scheduled' then "
+                    "The post IS scheduled, but its id could not be resolved "
+                    f"({len(hits)} rows matched its text) — no comment was added. "
+                    "Run 'fb post-list-scheduled' then "
                     "'fb comment-scheduled <#> \"text\"'.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            print(f"  post_id: {info['post_id']} (row [{info['index']}] {info['when']})")
-            _warn_if_schedule_drifted(info["when"], args.schedule)
-            cookies = load_cookies(args.profile)
-            actor_id = cookies["actor_id"]
-            session = create_session(cookies)
-            tokens = fetch_tokens(session)
-            _create_comment(session, tokens, actor_id, info["post_id"], args.comment)
+            row = hits[0]
+            print(f"  post_id: {row['post_id']} ({_fmt_epoch(row['scheduled'])})")
+            _warn_if_schedule_drifted_epoch(row["scheduled"], args.schedule)
+            _create_comment(session, tokens, actor_id, row["post_id"], args.comment)
         return
 
     schedule_epoch = _parse_schedule(args.schedule) if args.schedule else None
@@ -406,12 +430,142 @@ def _fetch_comments(session, tokens, actor_id, page_id, args, cursor):
     return (edges, page_info) if edges else None
 
 
+def _content_session(profile):
+    """Cookies + tokens for a Content Library read, as (session, tokens, actor)."""
+    cookies = load_cookies(profile)
+    actor_id = cookies["actor_id"]
+    session = create_session(cookies)
+    tokens = fetch_tokens(session)
+    return session, tokens, actor_id
+
+
+def _fmt_epoch(epoch: int) -> str:
+    """Local time for a Facebook timestamp; empty when there is none."""
+    if not epoch:
+        return ""
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
+
+
+def _print_content_rows(rows, show_metrics=False):
+    """Print a Content Library listing: 1-based index, time, id, preview."""
+    for i, row in enumerate(rows, 1):
+        when = _fmt_epoch(row["scheduled"] or row["created"]) or row["when_text"]
+        line = f"[{i}] {when}"
+        if row["when_text"]:
+            line += f"  ({row['when_text']})"
+        if row["group"]:
+            line += f"  in {row['group']}"
+        print(line)
+        preview = " ".join(row["text"].split())[:90] or "(no text)"
+        print(f"    {preview}")
+        tail = f"    post_id: {row['post_id']}"
+        if show_metrics and row["views"] is not None:
+            tail += f"   views: {row['views']}   engagement: {row['engagement']}"
+        print(tail)
+
+
+def _fetch_rows(args, filtering, limit, date_range="LAST_28D"):
+    """Read one Content Library tab, exiting with a clear message when empty."""
+    session, tokens, actor_id = _content_session(args.profile)
+    rows = fetch_content_library(
+        session, tokens, actor_id, filtering, limit=limit, date_range=date_range,
+    )
+    return session, tokens, actor_id, rows
+
+
+def _pick_row(rows, index, match, what):
+    """Resolve a 1-based index against `rows`, enforcing the --match guard."""
+    if index < 1 or index > len(rows):
+        print(f"Error: index {index} out of range (1..{len(rows)}).", file=sys.stderr)
+        sys.exit(1)
+    row = rows[index - 1]
+    haystack = " ".join(row["text"].split())
+    if match and match not in haystack and match not in row["when_text"]:
+        print(
+            f"ABORTED: {what} [{index}] does not match --match {match!r}.\n"
+            f"  Found instead: {row['when_text']} — {haystack[:80]}\n"
+            "  The list may have changed; list it again.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return row
+
+
 def cmd_list_scheduled(args):
     """List scheduled posts from the Content Library (Scheduled tab)."""
-    from scripts.fb_browser import list_scheduled_posts
-    asyncio.run(list_scheduled_posts(
-        args.profile, headless=not args.no_headless, with_ids=args.ids,
-    ))
+    if args.browser:
+        from scripts.fb_browser import list_scheduled_posts
+        asyncio.run(list_scheduled_posts(
+            args.profile, headless=not args.no_headless, with_ids=args.ids,
+        ))
+        return
+    _, _, _, rows = _fetch_rows(args, "SCHEDULED", args.count)
+    if not rows:
+        print("No scheduled posts.")
+        return
+    print(f"Scheduled posts ({len(rows)}):")
+    print("-" * 72)
+    _print_content_rows(rows)
+
+
+def cmd_list_published(args):
+    """List published posts from the Content Library (Published tab).
+
+    This is the only view of the account's own published posts that can be
+    trusted: scraping the profile page does not load the post wall here, so a
+    post that went out through the API had no way to be confirmed.
+    """
+    _, _, _, rows = _fetch_rows(args, "PUBLISHED", args.count, args.days)
+    if not rows:
+        print(f"No published posts in the last {args.days.lower().replace('last_', '')}.")
+        return
+    print(f"Published posts ({len(rows)}, {args.days}):")
+    print("-" * 72)
+    _print_content_rows(rows, show_metrics=True)
+
+
+def cmd_delete_published(args):
+    """Delete a published post — by list index, or directly by post id."""
+    session, tokens, actor_id, rows = _fetch_rows(
+        args, "PUBLISHED", max(args.index or 0, 25), args.days,
+    )
+    if args.post_id:
+        row = next((r for r in rows if r["post_id"] == args.post_id), None)
+        if not row:
+            print(
+                f"Error: post {args.post_id} is not in the last "
+                f"{args.days} of published posts — nothing deleted.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    else:
+        if not args.match:
+            print(
+                "Error: deleting a published post by index needs --match "
+                "\"<text from the post>\" — the list shifts as posts publish, "
+                "and this delete cannot be undone.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        row = _pick_row(rows, args.index, args.match, "published post")
+
+    when = _fmt_epoch(row["created"]) or row["when_text"]
+    print(f"Deleting published post {row['post_id']} ({when})")
+    print(f"  {' '.join(row['text'].split())[:90]}")
+    if not delete_story(session, tokens, actor_id, row["story_id"]):
+        print("FAILED: Facebook did not confirm the deletion.", file=sys.stderr)
+        sys.exit(1)
+    after = fetch_content_library(
+        session, tokens, actor_id, "PUBLISHED", limit=40, date_range=args.days,
+    )
+    if any(r["story_id"] == row["story_id"] for r in after):
+        print(
+            "FAILED: the post is still in the published list — "
+            "it was NOT deleted.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print("Deleted (confirmed gone from the published list).")
 
 
 def cmd_comment_scheduled(args):
@@ -422,35 +576,56 @@ def cmd_comment_scheduled(args):
     nothing to attach the URL comment to. The Content Library's post preview
     knows the id — resolve it there, then comment over the normal GraphQL path
     (feedback:<post_id> resolves before publish)."""
-    from scripts.fb_browser import resolve_scheduled_post_id
-    info = asyncio.run(resolve_scheduled_post_id(
-        args.profile,
-        index=args.index,
-        match=args.match,
-        headless=not args.no_headless,
-    ))
-    if not info:
-        print(
-            "Could not resolve a scheduled post to comment on — nothing was posted.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    print(f"Target [{info['index']}] {info['when']} — {info['text']}")
-    print(f"  post_id: {info['post_id']}")
-    cookies = load_cookies(args.profile)
-    actor_id = cookies["actor_id"]
-    session = create_session(cookies)
-    print("Fetching tokens from Facebook...")
-    tokens = fetch_tokens(session)
-    _create_comment(session, tokens, actor_id, info["post_id"], args.text)
+    if args.browser:
+        from scripts.fb_browser import resolve_scheduled_post_id
+        info = asyncio.run(resolve_scheduled_post_id(
+            args.profile,
+            index=args.index,
+            match=args.match,
+            headless=not args.no_headless,
+        ))
+        if not info:
+            print(
+                "Could not resolve a scheduled post to comment on — nothing was posted.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        post_id, when, text = info["post_id"], info["when"], info["text"]
+        session, tokens, actor_id = _content_session(args.profile)
+    else:
+        session, tokens, actor_id, rows = _fetch_rows(args, "SCHEDULED", 40)
+        row = _pick_row(rows, args.index, args.match, "scheduled post")
+        post_id = row["post_id"]
+        when = _fmt_epoch(row["scheduled"]) or row["when_text"]
+        text = " ".join(row["text"].split())[:60]
+    print(f"Target [{args.index}] {when} — {text}")
+    print(f"  post_id: {post_id}")
+    _create_comment(session, tokens, actor_id, post_id, args.text)
 
 
 def cmd_delete_scheduled(args):
     """Delete a scheduled post by its 1-based list index."""
-    from scripts.fb_browser import delete_scheduled_post
-    asyncio.run(delete_scheduled_post(
-        args.profile, args.index, headless=args.headless, match=args.match,
-    ))
+    if args.browser:
+        from scripts.fb_browser import delete_scheduled_post
+        asyncio.run(delete_scheduled_post(
+            args.profile, args.index, headless=args.headless, match=args.match,
+        ))
+        return
+    session, tokens, actor_id, rows = _fetch_rows(args, "SCHEDULED", 40)
+    row = _pick_row(rows, args.index, args.match, "scheduled post")
+    when = _fmt_epoch(row["scheduled"]) or row["when_text"]
+    print(f"Deleting [{args.index}] {when} — {' '.join(row['text'].split())[:70]}")
+    if not delete_story(session, tokens, actor_id, row["story_id"]):
+        print("FAILED: Facebook did not confirm the deletion.", file=sys.stderr)
+        sys.exit(1)
+    after = fetch_content_library(session, tokens, actor_id, "SCHEDULED", limit=40)
+    if any(r["story_id"] == row["story_id"] for r in after):
+        print(
+            "FAILED: the post is still scheduled — it was NOT deleted.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"Deleted. Scheduled posts: {len(rows)} -> {len(after)}")
 
 
 def cmd_report(args):
@@ -903,7 +1078,52 @@ def main():
     )
     pls_parser.add_argument(
         "--ids", action="store_true",
-        help="Also resolve each post's numeric post_id (~10s per post)",
+        help="--browser only: resolve each post's numeric post_id (~10s per "
+             "post). The default GraphQL listing always shows the id.",
+    )
+    pls_parser.add_argument(
+        "--count", type=int, default=25,
+        help="How many scheduled posts to list (default: 25)",
+    )
+    pls_parser.add_argument(
+        "--browser", action="store_true",
+        help="Scrape the dashboard with a browser instead of the API "
+             "(fallback if the Content Library query changes)",
+    )
+
+    # post-list-published (read-only)
+    plp_parser = subparsers.add_parser(
+        "post-list-published",
+        help="List published posts (Content Library > Published tab)",
+    )
+    plp_parser.add_argument(
+        "--count", type=int, default=10,
+        help="How many published posts to list (default: 10)",
+    )
+    plp_parser.add_argument(
+        "--days", choices=list(CONTENT_DATE_RANGES), default="LAST_28D",
+        help="How far back to look (default: LAST_28D)",
+    )
+
+    # post-delete (destructive, and a published post cannot be restored)
+    pdp_parser = subparsers.add_parser(
+        "post-delete",
+        help="Delete a published post by its index (from post-list-published) or id",
+    )
+    pdp_parser.add_argument(
+        "index", type=int, nargs="?",
+        help="1-based index shown by post-list-published (needs --match)",
+    )
+    pdp_parser.add_argument(
+        "--post-id", help="Delete by numeric post_id instead of an index",
+    )
+    pdp_parser.add_argument(
+        "--match",
+        help="Required with an index: abort unless the target's text contains this",
+    )
+    pdp_parser.add_argument(
+        "--days", choices=list(CONTENT_DATE_RANGES), default="LAST_28D",
+        help="Range the index/id is looked up in (default: LAST_28D)",
     )
 
     # comment-scheduled (adds a comment to an unpublished post -> write op)
@@ -919,7 +1139,12 @@ def main():
     )
     pcs_parser.add_argument(
         "--no-headless", action="store_true",
-        help="Run in headed mode (default: headless)",
+        help="--browser only: run in headed mode (default: headless)",
+    )
+    pcs_parser.add_argument(
+        "--browser", action="store_true",
+        help="Resolve the post id by opening the dashboard preview instead of "
+             "the API (fallback)",
     )
 
     # post-delete-scheduled (destructive -> headed by default, like send/post)
@@ -934,7 +1159,11 @@ def main():
     )
     pds_parser.add_argument(
         "--headless", action="store_true",
-        help="Run headless (default: headed)",
+        help="--browser only: run headless (default: headed)",
+    )
+    pds_parser.add_argument(
+        "--browser", action="store_true",
+        help="Delete through the dashboard UI instead of the API (fallback)",
     )
 
     # comments
@@ -1021,8 +1250,12 @@ def main():
         cmd_post(args)
     elif args.command == "post-list-scheduled":
         cmd_list_scheduled(args)
+    elif args.command == "post-list-published":
+        cmd_list_published(args)
     elif args.command == "post-delete-scheduled":
         cmd_delete_scheduled(args)
+    elif args.command == "post-delete":
+        cmd_delete_published(args)
     elif args.command == "comment-scheduled":
         cmd_comment_scheduled(args)
     elif args.command == "report":

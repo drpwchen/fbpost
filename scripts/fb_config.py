@@ -23,6 +23,21 @@ STORY_VIEW_DOC_ID = "25859627517041679"
 # in `allow`, which has to be read off this query rather than hardcoded.
 PRIVACY_SELECTOR_DOC_ID = "27910248861900432"
 
+# ProdashCometV2ContentLibraryQuery — the Content Library's own first page,
+# i.e. what the 已發佈 / 已排定發佈 / 草稿 tabs render. Answers with a DEFERRED
+# stream (several JSON chunks); the table arrives in a later chunk, so read it
+# with graphql_chunks(), not graphql_request().
+CONTENT_LIBRARY_DOC_ID = "27296449853323919"
+
+# ProdashCometV2ContentLibraryPaginationQuery — pages after the first. Its `id`
+# is the Content Library's own page id (returned alongside the table), NOT the
+# c_user id: passing c_user resolves a User node with no content library on it.
+CONTENT_LIBRARY_PAGE_DOC_ID = "27642268785365896"
+
+# useCometFeedStoryDeleteMutation — delete one of your own stories, published or
+# scheduled. Takes the base64 story id (UzpfS…), not the numeric post id.
+STORY_DELETE_DOC_ID = "27542772888736782"
+
 # base64('privacy_scope_renderer:{"id":8787670733}') — the timeline composer's
 # privacy scope, taken verbatim from the web client's own request.
 PRIVACY_WRITE_ID = "cHJpdmFjeV9zY29wZV9yZW5kZXJlcjp7ImlkIjo4Nzg3NjcwNzMzfQ"
