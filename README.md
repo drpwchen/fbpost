@@ -18,6 +18,37 @@ Facebook CLI tool — post, comments, replies, and Messenger automation via Grap
 > [PR #2](https://github.com/htlin222/fbpost/pull/2); they were closed unmerged
 > in July 2026. Anyone is welcome to take them from here.
 
+## What this version is like to use
+
+**API first, browser only when there is no API.** Posting, photos, scheduling,
+audiences, listing your own posts, deleting them, and commenting all go through
+Facebook's own GraphQL endpoints — seconds per command, no window opening.
+Playwright is still there for what genuinely needs a real browser (login,
+Messenger), and every converted command keeps its old browser implementation
+behind `--browser` for the day Facebook changes a query.
+
+**It refuses to claim success it did not verify.** A photo post reads back the
+id, an audience is re-read from the story Facebook stored, a schedule is
+compared against the epoch it kept, a deletion is confirmed by the post being
+gone from the library. The recurring bug in this space is a command that
+reports success while nothing happened; several of those are fixed here, and
+new features are built so the same failure cannot come back quietly.
+
+**Destructive things ask you to prove you mean them.** Deletes resolve the
+index in the same run, print what they are about to remove, and abort unless
+`--match` text is really in that row — deleting a published post by index
+without `--match` is refused outright. During testing that guard caught a
+genuinely wrong row.
+
+**Audiences are never guessed.** Subscriber-only sharing is not a privacy
+state: it is an account-specific list id, looked up at post time from your own
+audience list and keyed on a stable icon rather than a translated label. An
+unknown `--privacy` fails instead of falling back to a wider audience.
+
+**It says how it knows.** Every non-obvious payload in the code carries a note
+on how it was captured and what breaks if Facebook changes it, and the
+CHANGELOG records the real bug behind each fix rather than a version bump.
+
 ## Setup
 
 ### 1. Install dependencies
