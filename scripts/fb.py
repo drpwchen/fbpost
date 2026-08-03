@@ -638,7 +638,7 @@ def cmd_comments(args):
     else:
         print("No more pages.")
     profile_flag = f" --profile {args.profile}" if args.profile != "default" else ""
-    print(f"  Reply with: uv run fb.py{profile_flag} reply <#> \"your reply\"")
+    print(f"  Reply with: uv run fb{profile_flag} reply <#> \"your reply\"")
 
 
 # ── Comment (top-level, incl. scheduled posts) ──────────────────────────────

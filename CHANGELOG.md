@@ -29,6 +29,16 @@ PRs #1/#2 closed unmerged). MIT license and original copyright retained.
 - `--comment` now works with `--image`. It previously required `--schedule`
   because the composer path returned no post id; the API path returns one, so
   the URL-in-a-comment habit works on immediate photo posts too.
+- `post-delete-scheduled` could not delete anything: the row menu's 刪除貼文
+  item is visible and enabled, but an invisible full-width wrapper (and the
+  neighbouring post's text block) sits on top of it, so Playwright's
+  actionability click retried until it timed out and the command died with a
+  traceback. Clicks on the Content Library row controls now fall back to a
+  DOM click, which ignores pointer-event hit-testing. Applied to the row
+  actions button, the menu item, the confirmation dialog and the
+  post-preview button that `--ids` / `comment-scheduled` rely on.
+- `fb comments` printed its follow-up hint as `uv run fb.py reply`; the entry
+  point is `fb`, and `fb.py` fails with a ModuleNotFoundError.
 
 ### Notes
 

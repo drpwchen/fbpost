@@ -494,6 +494,23 @@ async def _teardown(p, browser, context, page=None):
         await p.stop()
 
 
+async def _click_through(locator, timeout: int = 6000) -> None:
+    """Click, falling back to a DOM click when something overlays the target.
+
+    Facebook keeps invisible full-width wrappers (and, on the Content Library
+    list, the neighbouring post's text block) on top of menu items, so
+    Playwright's actionability click can retry until it times out on an
+    element that is visible and enabled. Dispatching the click from inside
+    the page ignores pointer-event hit-testing; the element is still checked
+    for visibility first, so this does not click something that is not there.
+    """
+    try:
+        await locator.click(timeout=timeout)
+    except PlaywrightTimeoutError:
+        await locator.wait_for(state="visible", timeout=timeout)
+        await locator.evaluate("el => el.click()")
+
+
 async def _wait_composer_closed(page, dialog, seconds=15) -> bool:
     """Poll for the composer dialog to disappear; True means it closed.
 
@@ -1166,7 +1183,7 @@ async def _row_post_id(page, actions, index: int, wait_ms: int = 20000):
                 file=sys.stderr,
             )
             return None, []
-        await btn.first.click(timeout=8000)
+        await _click_through(btn.first, timeout=8000)
         for _ in range(max(1, wait_ms // 500)):
             if found:
                 break
@@ -1351,9 +1368,9 @@ async def delete_scheduled_post(profile: str, index: int, headless: bool = False
             sys.exit(1)
         print(f"Deleting [{index}] {target['when']} — {target['text']}")
 
-        await actions.nth(target["index"]).click(timeout=6000)
+        await _click_through(actions.nth(target["index"]))
         await page.wait_for_timeout(1500)
-        await page.get_by_role("menuitem", name=_DELETE_MENUITEM).first.click(timeout=6000)
+        await _click_through(page.get_by_role("menuitem", name=_DELETE_MENUITEM).first)
         await page.wait_for_timeout(1500)
 
         # Confirmation dialog: click its primary delete/confirm button.
@@ -1364,7 +1381,7 @@ async def delete_scheduled_post(profile: str, index: int, headless: bool = False
             for name in ["刪除貼文", "刪除", "確認"]:
                 b = dlg.get_by_role("button", name=name)
                 if await b.count():
-                    await b.first.click(timeout=5000)
+                    await _click_through(b.first, timeout=5000)
                     break
         await page.wait_for_timeout(4000)
 
