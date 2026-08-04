@@ -5,6 +5,20 @@ Originally forked from [htlin222/fbpost](https://github.com/htlin222/fbpost);
 maintained standalone since 2026-07-30 (upstream inactive since March 2026,
 PRs #1/#2 closed unmerged). MIT license and original copyright retained.
 
+## [0.7.2] - 2026-08-04
+
+### Added
+
+- `fb post-list-scheduled` now prints each post's stored audience (`[所有人]` /
+  `[僅限訂閱者]` …). The Content Library row carries no audience field, so the
+  privacy is read back per post through the existing `fetch_story_privacy()`
+  — one extra request each, skippable with `--no-audience`. Without it a
+  public post and a subscribers-only one look identical in the listing, which
+  is how two posts got scheduled into the same slot on the assumption that
+  they would compete for the same feed.
+- A post whose privacy cannot be read prints no audience at all rather than a
+  guessed one.
+
 ## [0.7.1] - 2026-08-03
 
 ### Fixed

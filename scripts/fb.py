@@ -529,6 +529,8 @@ def _print_content_rows(rows, show_metrics=False):
         line = f"[{i}] {when}"
         if row["when_text"]:
             line += f"  ({row['when_text']})"
+        if row.get("audience"):
+            line += f"  [{row['audience']}]"
         if row["group"]:
             line += f"  in {row['group']}"
         print(line)
@@ -538,6 +540,26 @@ def _print_content_rows(rows, show_metrics=False):
         if show_metrics and row["views"] is not None:
             tail += f"   views: {row['views']}   engagement: {row['engagement']}"
         print(tail)
+
+
+def _annotate_audience(session, tokens, actor_id, rows):
+    """Fill each row's "audience" with the audience Facebook actually stored.
+
+    One extra GraphQL round trip per row. A row whose privacy cannot be read
+    is left blank rather than guessed — an unknown audience must never print
+    as "公開".
+    """
+    from scripts.fb_session import fetch_story_privacy
+
+    for row in rows:
+        if not row.get("story_id"):
+            continue
+        try:
+            privacy = fetch_story_privacy(session, tokens, actor_id, row["story_id"])
+        except Exception:
+            privacy = None
+        if privacy and privacy.get("label"):
+            row["audience"] = privacy["label"]
 
 
 def _fetch_rows(args, filtering, limit, date_range="LAST_28D"):
@@ -575,10 +597,17 @@ def cmd_list_scheduled(args):
             args.profile, headless=not args.no_headless, with_ids=args.ids,
         ))
         return
-    _, _, _, rows = _fetch_rows(args, "SCHEDULED", args.count)
+    session, tokens, actor_id, rows = _fetch_rows(args, "SCHEDULED", args.count)
     if not rows:
         print("No scheduled posts.")
         return
+    if not args.no_audience:
+        # The listing row itself carries no audience, so each story's stored
+        # privacy is read back separately. Without it a public post and a
+        # subscribers-only one look identical here, which is exactly how two
+        # posts get scheduled into the same slot on the wrong assumption
+        # (2026-08-04).
+        _annotate_audience(session, tokens, actor_id, rows)
     print(f"Scheduled posts ({len(rows)}):")
     print("-" * 72)
     _print_content_rows(rows)
@@ -1165,6 +1194,11 @@ def main():
         "--browser", action="store_true",
         help="Scrape the dashboard with a browser instead of the API "
              "(fallback if the Content Library query changes)",
+    )
+    pls_parser.add_argument(
+        "--no-audience", action="store_true",
+        help="Skip the per-post audience lookup (公開 / 訂閱者 …), which costs "
+             "one extra request per listed post",
     )
 
     # post-list-published (read-only)

@@ -191,7 +191,8 @@ Suite is unavailable, so that library is the source of truth. These commands
 query it over GraphQL — a couple of seconds each, no browser.
 
 ```bash
-uv run fb post-list-scheduled              # scheduled posts: index, time, post_id, preview
+uv run fb post-list-scheduled              # scheduled posts: index, time, audience, post_id, preview
+uv run fb post-list-scheduled --no-audience # skip the per-post audience lookup (1 extra request each)
 uv run fb post-list-published              # published posts: same, plus views / engagement
 uv run fb post-list-published --count 25 --days LAST_90D
 
